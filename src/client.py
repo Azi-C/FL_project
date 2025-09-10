@@ -1,7 +1,7 @@
 # client.py
 import torch
 from model import create_model
-from utils import load_data, load_partition_for_client, train_one_epoch, accuracy, DEVICE
+from utils import load_data, train_one_epoch, accuracy, DEVICE
 from typing import List
 import numpy as np
 
