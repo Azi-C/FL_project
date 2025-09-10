@@ -1,46 +1,32 @@
 # main.py
-import argparse
-import flwr as fl
+import threading
+import time
 from server import run_server
 from client import run_client
 
-def main():
-    parser = argparse.ArgumentParser(description="Federated Learning with Flower")
-    subparsers = parser.add_subparsers(dest="role", required=True)
+def start_server():
+    run_server(server_address="0.0.0.0:8080", num_rounds=3)
 
-    # --- Server mode ---
-    server_parser = subparsers.add_parser("server", help="Run Flower server")
-    server_parser.add_argument(
-        "--rounds", type=int, default=3, help="Number of FL rounds"
-    )
-    server_parser.add_argument(
-        "--address", type=str, default="0.0.0.0:8080", help="Server address"
-    )
-
-    # --- Client mode ---
-    client_parser = subparsers.add_parser("client", help="Run Flower client")
-    client_parser.add_argument(
-        "--id", type=int, default=0, help="Client partition ID"
-    )
-    client_parser.add_argument(
-        "--num-clients", type=int, default=2, help="Total number of clients"
-    )
-    client_parser.add_argument(
-        "--address", type=str, default="0.0.0.0:8080", help="Server address"
-    )
-
-    args = parser.parse_args()
-
-    if args.role == "server":
-        print(f"Starting server at {args.address} for {args.rounds} rounds...")
-        run_server(server_address=args.address, num_rounds=args.rounds)
-    elif args.role == "client":
-        print(f"Starting client {args.id}/{args.num_clients} connecting to {args.address}...")
-        run_client(
-            server_address=args.address,
-            client_id=args.id,
-            num_clients=args.num_clients
-        )
+def start_client(cid):
+    run_client(server_address="0.0.0.0:8080", client_id=cid, num_clients=2)
 
 if __name__ == "__main__":
-    main()
+    # Start server in a thread
+    server_thread = threading.Thread(target=start_server, daemon=True)
+    server_thread.start()
+
+    # Small delay so server starts before clients connect
+    time.sleep(2)
+
+    # Start two clients in their own threads
+    client_threads = []
+    for cid in range(2):
+        t = threading.Thread(target=start_client, args=(cid,))
+        t.start()
+        client_threads.append(t)
+
+    # Wait for clients to finish
+    for t in client_threads:
+        t.join()
+
+    print("Federated Learning simulation completed.")
