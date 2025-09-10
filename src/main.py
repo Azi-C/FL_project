@@ -11,21 +11,21 @@ def start_client(cid):
     run_client(server_address="0.0.0.0:8080", client_id=cid, num_clients=2)
 
 if __name__ == "__main__":
-    # Start server in a thread
+    # Start server in a separate thread
     server_thread = threading.Thread(target=start_server, daemon=True)
     server_thread.start()
 
-    # Small delay so server starts before clients connect
+    # Wait for server to be ready
     time.sleep(2)
 
-    # Start two clients in their own threads
+    # Start two clients
     client_threads = []
     for cid in range(2):
         t = threading.Thread(target=start_client, args=(cid,))
         t.start()
         client_threads.append(t)
 
-    # Wait for clients to finish
+    # Wait for all clients to finish
     for t in client_threads:
         t.join()
 

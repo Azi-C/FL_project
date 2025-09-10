@@ -1,3 +1,4 @@
+# utils.py
 from typing import Tuple, Optional
 import torch
 from torch.utils.data import DataLoader, random_split, Subset
@@ -29,7 +30,6 @@ def load_partition_for_client(
 ) -> DataLoader:
     """Create an IID partition of the 90% training split for a given client."""
     trainloader, valloader = load_train_val(batch_size=batch_size, num_workers=num_workers, seed=seed)
-    # Grab the underlying Subset of the train split and repartition it IID by shuffling indices
     train_subset: Subset = trainloader.dataset  # type: ignore
     indices = torch.randperm(len(train_subset), generator=torch.Generator().manual_seed(seed)).tolist()
     part_size = len(indices) // num_clients

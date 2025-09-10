@@ -1,3 +1,4 @@
+# client.py
 import torch
 import torch.nn as nn
 import torch.optim as optim
@@ -13,8 +14,6 @@ def params_to_numpy(model: torch.nn.Module):
 
 def numpy_to_params(model: torch.nn.Module, parameters):
     keys = list(model.state_dict().keys())
-    if len(keys) != len(parameters):
-        raise ValueError("Parameter length mismatch.")
     state = {k: torch.tensor(v) for k, v in zip(keys, parameters)}
     model.load_state_dict(state, strict=True)
 
@@ -31,7 +30,6 @@ def train_one_epoch(model, loader, device=DEVICE, lr=0.01):
         optimizer.step()
 
 class FlowerClient(fl.client.NumPyClient):
-    """Trains on its partition of the 90% split; evaluates on the shared 10% val set."""
     def __init__(self, client_id: int, num_clients: int = 10, epochs: int = 1, lr: float = 0.01):
         self.client_id = client_id
         self.num_clients = num_clients
@@ -39,7 +37,6 @@ class FlowerClient(fl.client.NumPyClient):
         self.lr = lr
         self.model = create_model().to(DEVICE)
         self.trainloader = load_partition_for_client(client_id=client_id, num_clients=num_clients)
-        # Create once (deterministic) so all clients share the same validation split
         _, self.valloader = load_train_val()
 
     def get_parameters(self, config):
@@ -47,23 +44,17 @@ class FlowerClient(fl.client.NumPyClient):
 
     def fit(self, parameters, config):
         numpy_to_params(self.model, parameters)
-        local_epochs = int(config.get("local_epochs", self.epochs))
-        for _ in range(local_epochs):
+        for _ in range(self.epochs):
             train_one_epoch(self.model, self.trainloader, DEVICE, lr=self.lr)
-        num_examples = len(self.trainloader.dataset)
-        return self.get_parameters({}), num_examples, {}
+        return self.get_parameters({}), len(self.trainloader.dataset), {}
 
     def evaluate(self, parameters, config):
         numpy_to_params(self.model, parameters)
         acc = evaluate_accuracy(self.model, self.valloader, DEVICE)
         return float(1.0 - acc), len(self.valloader.dataset), {"val_accuracy": acc}
 
-def run_client(server_address: str = "0.0.0.0:8080", client_id: int = 0, num_clients: int = 10):
+def run_client(server_address: str = "0.0.0.0:8080", client_id: int = 0, num_clients: int = 2):
     fl.client.start_numpy_client(
         server_address=server_address,
         client=FlowerClient(client_id=client_id, num_clients=num_clients),
     )
-
-if __name__ == "__main__":
-    # Example: python client.py  (defaults)
-    run_client()
