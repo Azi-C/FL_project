@@ -10,7 +10,6 @@ from utils import (
     DEVICE,
 )
 
-# ---- Helpers: torch <-> numpy for state_dict ----
 def params_to_numpy(model: torch.nn.Module) -> List[np.ndarray]:
     return [p.detach().cpu().numpy() for _, p in model.state_dict().items()]
 
@@ -42,11 +41,9 @@ class Peer:
 
         self.model = create_model().to(DEVICE)
         try:
-            # Try to load client-specific data partition
             self.trainloader = load_partition_for_client(client_id=cid, num_clients=num_clients)
         except Exception:
-            # Fallback: use full dataset if partitioning not yet implemented
-            self.trainloader, _ = load_data()
+=            self.trainloader, _ = load_data()
 
         # Shared test set for evaluation
         _, self.testloader = load_data()

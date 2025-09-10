@@ -19,8 +19,7 @@ class Net(nn.Module):
         x = torch.flatten(x, 1)                   # -> 256
         x = torch.relu(self.fc1(x))
         x = torch.relu(self.fc2(x))
-        return self.fc3(x)                        # logits
-
+        return self.fc3(x)                        
 def create_model():
     """Factory to create a new Net instance."""
     return Net()

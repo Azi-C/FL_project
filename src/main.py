@@ -3,7 +3,7 @@ import threading, time
 from server import run_server
 from client import run_client
 
-ADDR = "127.0.0.1:8080"   # safer in Codespaces
+ADDR = "127.0.0.1:8080"
 
 def start_server():
     run_server(server_address=ADDR, num_rounds=3)
@@ -15,7 +15,7 @@ if __name__ == "__main__":
     s = threading.Thread(target=start_server, daemon=True)
     s.start()
 
-    time.sleep(4)  # <-- increase boot delay
+    time.sleep(4)
 
     clients = []
     for cid in range(2):

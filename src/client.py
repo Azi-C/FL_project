@@ -28,11 +28,11 @@ class FlowerClient(fl.client.NumPyClient):
         epochs = int(config.get("local_epochs", self.local_epochs))
         for _ in range(epochs):
             train_one_epoch(self.model, self.trainloader, lr=self.lr)
+
         # return updated weights + number of examples
         return self.get_parameters({}), len(self.trainloader.dataset), {}
 
     def evaluate(self, parameters, config):
-        # (Optional) implement if you want server-side eval aggregation
         keys = list(self.model.state_dict().keys())
         state = {k: torch.tensor(v) for k, v in zip(keys, parameters)}
         self.model.load_state_dict(state, strict=True)
@@ -42,7 +42,7 @@ class FlowerClient(fl.client.NumPyClient):
 def run_client(server_address: str = "127.0.0.1:8080"):
     fl.client.start_client(
         server_address=server_address,
-        client=FlowerClient().to_client(),  # <- new API (no deprecation warning)
+        client=FlowerClient().to_client(),
     )
 
 if __name__ == "__main__":
