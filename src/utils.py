@@ -1,60 +1,52 @@
-# src/utils.py
-from typing import Tuple
+from typing import Tuple, Optional
 import torch
-from torch.utils.data import DataLoader, Subset, random_split
+from torch.utils.data import DataLoader, random_split, Subset
 from torchvision import datasets, transforms
 
 DATA_DIR = "./data"
-BATCH_SIZE = 16
-NUM_WORKERS = 2
-VAL_SPLIT = 0.10
-SEED = 42  # fixed seed for deterministic split
 
-# Shared transforms (same normalize for train/val)
-_train_tf = transforms.Compose([
-    transforms.ToTensor(),
-    transforms.Normalize((0.1307,), (0.3081,))
-])
-_val_tf = transforms.Compose([
-    transforms.ToTensor(),
-    transforms.Normalize((0.1307,), (0.3081,))
-])
+def load_train_val(
+    batch_size: int = 32,
+    val_split: float = 0.10,
+    num_workers: int = 2,
+    seed: int = 42,
+) -> Tuple[DataLoader, DataLoader]:
+    """Return trainloader (90%) and valloader (10%) with deterministic split."""
+    tf = transforms.Compose([transforms.ToTensor(), transforms.Normalize((0.1307,), (0.3081,))])
+    full_train = datasets.MNIST(DATA_DIR, train=True, download=True, transform=tf)
 
-def create_validation_loader() -> DataLoader:
-    """Create a deterministic 10% validation loader shared by all clients."""
-    full_train = datasets.MNIST(DATA_DIR, train=True, download=True, transform=_train_tf)
+    val_size = int(len(full_train) * val_split)  # 6000
+    train_size = len(full_train) - val_size      # 54000
+    gen = torch.Generator().manual_seed(seed)
+    train_set, val_set = random_split(full_train, [train_size, val_size], generator=gen)
 
-    # Random, deterministic split into train + val (90/10)
-    val_size = int(len(full_train) * VAL_SPLIT)
-    train_size = len(full_train) - val_size
-    gen = torch.Generator().manual_seed(SEED)
-    _, val_set = random_split(full_train, [train_size, val_size], generator=gen)
+    trainloader = DataLoader(train_set, batch_size=batch_size, shuffle=True,  num_workers=num_workers)
+    valloader  = DataLoader(val_set,  batch_size=batch_size, shuffle=False, num_workers=num_workers)
+    return trainloader, valloader
 
-    # Use the same normalization for val (define transform at dataset creation)
-    # (We already set transform on full_train; random_split keeps it.)
-    valloader = DataLoader(val_set, batch_size=BATCH_SIZE, shuffle=False, num_workers=NUM_WORKERS)
-    return valloader
-
-def load_client_trainloader(partition_id: int, num_clients: int = 10) -> DataLoader:
-    """
-    Return a train DataLoader for a given client partition, using only the 90% train portion.
-    Partitions are IID by shuffling indices with a fixed seed, then slicing equally.
-    """
-    full_train = datasets.MNIST(DATA_DIR, train=True, download=True, transform=_train_tf)
-
-    # First, make the same 90/10 split as above (so train set excludes validation)
-    val_size = int(len(full_train) * VAL_SPLIT)
-    train_size = len(full_train) - val_size
-    gen = torch.Generator().manual_seed(SEED)
-    train_set, _ = random_split(full_train, [train_size, val_size], generator=gen)
-
-    # Create IID partitions by shuffling indices deterministically
-    indices = torch.randperm(len(train_set), generator=gen).tolist()
+def load_partition_for_client(
+    client_id: int, num_clients: int = 10, batch_size: int = 32, num_workers: int = 2, seed: int = 42
+) -> DataLoader:
+    """Create an IID partition of the 90% training split for a given client."""
+    trainloader, valloader = load_train_val(batch_size=batch_size, num_workers=num_workers, seed=seed)
+    # Grab the underlying Subset of the train split and repartition it IID by shuffling indices
+    train_subset: Subset = trainloader.dataset  # type: ignore
+    indices = torch.randperm(len(train_subset), generator=torch.Generator().manual_seed(seed)).tolist()
     part_size = len(indices) // num_clients
-    start = partition_id * part_size
-    end = len(indices) if partition_id == num_clients - 1 else start + part_size
+    start = client_id * part_size
+    end = len(indices) if client_id == num_clients - 1 else start + part_size
     part_indices = indices[start:end]
+    client_set = Subset(train_subset, part_indices)
+    return DataLoader(client_set, batch_size=batch_size, shuffle=True, num_workers=num_workers)
 
-    client_subset = Subset(train_set, part_indices)
-    trainloader = DataLoader(client_subset, batch_size=BATCH_SIZE, shuffle=True, num_workers=NUM_WORKERS)
-    return trainloader
+@torch.no_grad()
+def evaluate_accuracy(model: torch.nn.Module, loader: DataLoader, device: Optional[torch.device] = None) -> float:
+    device = device or torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    model.eval().to(device)
+    correct, total = 0, 0
+    for x, y in loader:
+        x, y = x.to(device), y.to(device)
+        preds = model(x).argmax(dim=1)
+        correct += (preds == y).sum().item()
+        total += y.size(0)
+    return correct / total if total > 0 else 0.0
