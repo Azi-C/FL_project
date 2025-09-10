@@ -1,49 +1,58 @@
+# client.py
 import torch
-import torch.nn as nn
-import torch.optim as optim
-from torchvision import datasets, transforms
-from torch.utils.data import DataLoader
-import flwr as fl
-from utils import load_data, train_one_epoch, accuracy, DEVICE
 from model import create_model
+from utils import load_data, load_partition_for_client, train_one_epoch, accuracy, DEVICE
+from typing import List
+import numpy as np
+
+# ---------- Helpers: model params <-> numpy ----------
+def params_to_numpy(model: torch.nn.Module) -> List[np.ndarray]:
+    return [p.detach().cpu().numpy() for _, p in model.state_dict().items()]
+
+def numpy_to_params(model: torch.nn.Module, params: List[np.ndarray]) -> None:
+    keys = list(model.state_dict().keys())
+    state = {k: torch.tensor(v) for k, v in zip(keys, params)}
+    model.load_state_dict(state, strict=True)
 
 
-# --- Flower NumPyClient ---
-class FlowerClient(fl.client.NumPyClient):
-    def __init__(self, local_epochs=1, lr=0.01):
-        self.model = create_model().to(DEVICE)
-        self.trainloader, self.testloader = load_data()
-        self.local_epochs = local_epochs
+class Client:
+    """
+    Basic client:
+    - holds its own model and data partition
+    - can set/get global params
+    - can train locally and evaluate
+    """
+    def __init__(self, cid: int, num_clients: int, lr: float = 0.01, local_epochs: int = 1):
+        self.cid = cid
+        self.num_clients = num_clients
         self.lr = lr
+        self.local_epochs = local_epochs
 
-    def get_parameters(self, config):
-        return [p.detach().cpu().numpy() for _, p in self.model.state_dict().items()]
+        self.model = create_model().to(DEVICE)
 
-    def fit(self, parameters, config):
-        # load global weights
-        keys = list(self.model.state_dict().keys())
-        state = {k: torch.tensor(v) for k, v in zip(keys, parameters)}
-        self.model.load_state_dict(state, strict=True)
-        # local training
-        epochs = int(config.get("local_epochs", self.local_epochs))
-        for _ in range(epochs):
-            train_one_epoch(self.model, self.trainloader, lr=self.lr)
+        # Partitioned train set per client (fallback to full train if not available)
+        try:
+            self.trainloader = load_partition_for_client(client_id=cid, num_clients=num_clients)
+        except Exception:
+            self.trainloader, _ = load_data()
 
-        # return updated weights + number of examples
-        return self.get_parameters({}), len(self.trainloader.dataset), {}
+        # Shared test set for reporting
+        _, self.testloader = load_data()
 
-    def evaluate(self, parameters, config):
-        keys = list(self.model.state_dict().keys())
-        state = {k: torch.tensor(v) for k, v in zip(keys, parameters)}
-        self.model.load_state_dict(state, strict=True)
-        acc = accuracy(self.model, self.testloader)
-        return float(1.0 - acc), len(self.testloader.dataset), {"test_accuracy": acc}
+    # ---- synchronization ----
+    def set_params(self, params: List[np.ndarray]) -> None:
+        numpy_to_params(self.model, params)
 
-def run_client(server_address: str = "127.0.0.1:8080"):
-    fl.client.start_client(
-        server_address=server_address,
-        client=FlowerClient().to_client(),
-    )
+    def get_params(self) -> List[np.ndarray]:
+        return params_to_numpy(self.model)
 
-if __name__ == "__main__":
-    run_client()
+    def num_examples(self) -> int:
+        return len(self.trainloader.dataset)
+
+    # ---- local work ----
+    def train_local(self) -> None:
+        for _ in range(self.local_epochs):
+            train_one_epoch(self.model, self.trainloader, lr=self.lr, device=DEVICE)
+
+    def evaluate(self) -> float:
+        return accuracy(self.model, self.testloader, device=DEVICE)
