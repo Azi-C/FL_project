@@ -1,13 +1,9 @@
 # aggregator.py
-from typing import List, Tuple
+from typing import List, Tuple, Dict, Any
 import numpy as np
 from client import Client
 
 def _fedavg(updates: List[Tuple[int, List[np.ndarray]]]) -> List[np.ndarray]:
-    """
-    FedAvg pondéré :
-    \tilde{w}^{t+1} = (Σ |D_i| * m'_i) / (Σ |D_i|)
-    """
     total = sum(n for n, _ in updates)
     if total == 0:
         raise ValueError("No samples to aggregate.")
@@ -21,8 +17,8 @@ def _fedavg(updates: List[Tuple[int, List[np.ndarray]]]) -> List[np.ndarray]:
 
 class Aggregator(Client):
     """
-    Un agrégateur = un client capable en plus d'agréger.
-    Peut (optionnellement) filtrer avec un seuil de validation τ sur V.
+    Aggregator extends Client with aggregation.
+    Returns aggregation result AND a validation report for reputation updates.
     """
     def aggregate(
         self,
@@ -30,14 +26,16 @@ class Aggregator(Client):
         valloader=None,
         clients: List[Client] | None = None,
         tau: float = 0.90,
-    ) -> List[np.ndarray]:
-        # Sans validation fournie : on agrège tout le monde
+    ) -> Tuple[List[np.ndarray], Dict[str, Any]]:
+        # If no validation context: aggregate all, empty report
         if valloader is None or clients is None:
-            return _fedavg(updates)
+            return _fedavg(updates), {"passed": [], "failed": []}
 
         eligible: List[Tuple[int, List[np.ndarray]]] = []
+        passed, failed = [], []  # lists of tuples (cid, val_acc)
+
+        # Validate every candidate update on V, but restore params after check
         for (n, params), c in zip(updates, clients):
-            # Tester les params candidats sur V puis restaurer
             old = c.get_params()
             c.set_params(params)
             val_acc = c.evaluate_on(valloader)
@@ -45,8 +43,14 @@ class Aggregator(Client):
 
             if val_acc >= tau:
                 eligible.append((n, params))
+                passed.append((c.cid, float(val_acc)))
+            else:
+                failed.append((c.cid, float(val_acc)))
 
-        if not eligible:  # fallback pour ne pas bloquer l'apprentissage
+        # Fallback if all failed (keep training progressing)
+        if not eligible:
             eligible = updates
 
-        return _fedavg(eligible)
+        aggregated = _fedavg(eligible)
+        report = {"passed": passed, "failed": failed}
+        return aggregated, report
