@@ -1,12 +1,19 @@
 # strategy.py
 from typing import List, Tuple, Dict, Sequence, Optional
 import torch
+import json
 
 from model import create_model
 from client import Client, params_to_numpy, numpy_to_params
 from aggregator import Aggregator
 from utils import DEVICE, load_validation_loader
-from persistence import save_json, load_json, save_model_state_dict
+from persistence import (
+    save_json,
+    load_json,
+    save_model_state_dict,
+    ensure_csv,
+    append_csv_row,
+)
 
 
 def select_by_reputation(
@@ -32,11 +39,11 @@ def run_rounds(
     tau: float = 0.90,
     gamma: float = 0.20,
     k_aggregators: int = 1,
-    non_iid: bool = False,                   # keep IID by default
-    labels_per_client: int = 2,              # used only if non_iid=True
-    proportions: Optional[Sequence[float]] = None,  # imbalance via explicit proportions
-    dirichlet_alpha: Optional[float] = None,        # or via Dirichlet(alpha)
-    reset_reputation: bool = False,                 # force fresh r_i^(0)
+    non_iid: bool = False,
+    labels_per_client: int = 2,
+    proportions: Optional[Sequence[float]] = None,
+    dirichlet_alpha: Optional[float] = None,
+    reset_reputation: bool = False,
 ):
     if num_clients < 1:
         raise ValueError("num_clients must be >= 1")
@@ -72,13 +79,18 @@ def run_rounds(
     # ---- persistence paths ----
     reputation_path = "artifacts/reputation.json"
     ckpt_dir = "artifacts/checkpoints"
+    csv_path = "artifacts/metrics.csv"
+    csv_fields = [
+        "round", "avg_acc", "chosen_aggregators", "passed", "failed",
+        "reputations", "client_sizes"
+    ]
+    ensure_csv(csv_path, csv_fields)
 
     # ---- initial reputation r_i^(0) = |D_i| / Σ|D_j| ----
     sizes = [c.num_examples() for c in clients]
     total_k = float(sum(sizes)) if sum(sizes) > 0 else 1.0
     reputation: Dict[int, float] = {c.cid: (sizes[i] / total_k) for i, c in enumerate(clients)}
 
-    # Debug: show sizes and init reps
     print("Client sizes:", {c.cid: sizes[i] for i, c in enumerate(clients)})
     print("Init reputations:", {c.cid: round(reputation[c.cid], 4) for c in clients})
 
@@ -114,15 +126,14 @@ def run_rounds(
             raise RuntimeError("No aggregators available; check num_aggregators.")
         print(f"Chosen aggregator(s): {[a.cid for a in chosen]}")
 
-        # 4) aggregate with validation report (use the first chosen)
+        # 4) aggregate with validation report
         aggregated, report = chosen[0].aggregate(
             updates, valloader=valloader, clients=clients, tau=tau
         )
 
-        # 5) update reputations (+1 if passed V, -1 otherwise)
+        # 5) update reputations
         passed = set(cid for cid, _ in report.get("passed", []))
         failed = set(cid for cid, _ in report.get("failed", []))
-
         for cid in passed:
             reputation[cid] = reputation.get(cid, 0.0) + 1.0
         for cid in failed:
@@ -133,7 +144,6 @@ def run_rounds(
 
         # 6) update global params and evaluate
         global_params = aggregated
-
         accs = []
         for c in clients:
             c.set_params(global_params)
@@ -141,9 +151,20 @@ def run_rounds(
         avg_acc = sum(accs) / len(accs)
         print(f"Average accuracy after round {rnd}: {avg_acc:.4f}")
 
-        # 7) persist reputation and checkpoint for this round
+        # 7) log CSV for this round
+        row = {
+            "round": rnd,
+            "avg_acc": avg_acc,
+            "chosen_aggregators": json.dumps([a.cid for a in chosen]),
+            "passed": json.dumps(sorted(list(passed))),
+            "failed": json.dumps(sorted(list(failed))),
+            "reputations": json.dumps({int(cid): float(r) for cid, r in reputation.items()}),
+            "client_sizes": json.dumps({int(c.cid): int(sizes[i]) for i, c in enumerate(clients)}),
+        }
+        append_csv_row(csv_path, row, csv_fields)
+
+        # 8) persist reputation and checkpoint
         save_json(reputation_path, {str(cid): float(r) for cid, r in reputation.items()})
-        # save checkpoint: load global_params -> global_model -> save state_dict
         numpy_to_params(global_model, global_params)
         save_model_state_dict(f"{ckpt_dir}/round_{rnd:03d}.pt", global_model.state_dict())
 
@@ -154,7 +175,6 @@ def run_rounds(
 
 
 if __name__ == "__main__":
-    # Example run with explicit imbalance (proportions must match num_clients)
     run_rounds(
         num_clients=4,
         num_aggregators=2,
@@ -164,8 +184,8 @@ if __name__ == "__main__":
         tau=0.90,
         gamma=0.20,
         k_aggregators=1,
-        non_iid=False,                            # keep IID
-        proportions=[0.5, 0.2, 0.2, 0.1],         # <-- imbalanced sizes
+        non_iid=False,
+        proportions=[0.5, 0.2, 0.2, 0.1],
         dirichlet_alpha=None,
-        reset_reputation=True,                    # ignore old reputation.json
+        reset_reputation=True,
     )
