@@ -1,7 +1,7 @@
 # persistence.py
 import json, os
-from typing import Dict, Any, List
 import torch
+from typing import Dict, Any
 
 def save_json(path: str, obj: Dict[str, Any]) -> None:
     os.makedirs(os.path.dirname(path), exist_ok=True)
