@@ -75,7 +75,7 @@ def run_rounds(
 if __name__ == "__main__":
     run_rounds(
         num_clients=4,
-        num_aggregators=1,
+        num_aggregators=2,
         num_rounds=3,
         local_epochs=1,
         lr=0.01,

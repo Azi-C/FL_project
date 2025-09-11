@@ -17,7 +17,7 @@ def numpy_to_params(model: torch.nn.Module, params: List[np.ndarray]) -> None:
 
 class Client:
     """
-    Basic client:
+    client:
     - holds its own model and data partition
     - can set/get global params
     - can train locally and evaluate
@@ -30,13 +30,13 @@ class Client:
 
         self.model = create_model().to(DEVICE)
 
-        # Partitioned train set per client (fallback to full train if not available)
+        # tarining dataset
         try:
             self.trainloader = load_partition_for_client(client_id=cid, num_clients=num_clients)
         except Exception:
             self.trainloader, _ = load_data()
 
-        # Shared test set for reporting
+        # Shared test set
         _, self.testloader = load_data()
 
     # ---- synchronization ----
@@ -49,7 +49,7 @@ class Client:
     def num_examples(self) -> int:
         return len(self.trainloader.dataset)
 
-    # ---- local work ----
+    # ---- local training & evaluation ----
     def train_local(self) -> None:
         for _ in range(self.local_epochs):
             train_one_epoch(self.model, self.trainloader, lr=self.lr, device=DEVICE)

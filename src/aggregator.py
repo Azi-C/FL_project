@@ -1,4 +1,3 @@
-# aggregator.py
 from typing import List, Tuple
 import numpy as np
 from client import Client
@@ -10,7 +9,7 @@ class Aggregator(Client):
     def aggregate(self, updates: List[Tuple[int, List[np.ndarray]]]) -> List[np.ndarray]:
         """
         FedAvg:
-        \tilde{w}^{t+1} = (Σ |D_i| * m'_i) / (Σ |D_i|)
+        new model = (Σ |D_i| * m'_i) / (Σ |D_i|)
         """
         total = sum(n for n, _ in updates)
         if total == 0:
