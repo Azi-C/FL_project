@@ -21,5 +21,5 @@ class Net(nn.Module):
         x = torch.relu(self.fc2(x))
         return self.fc3(x)                        
 def create_model():
-    """Factory to create a new Net instance."""
+    """ create a new Net instance."""
     return Net()

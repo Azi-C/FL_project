@@ -3,7 +3,7 @@ import torch
 import torch.nn as nn
 import torch.optim as optim
 from torchvision import datasets, transforms
-from torch.utils.data import DataLoader
+from torch.utils.data import DataLoader, random_split
 
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
@@ -18,6 +18,18 @@ def load_data(batch_size: int = 32):
     trainloader = DataLoader(trainset, batch_size=batch_size, shuffle=True,  num_workers=2)
     testloader  = DataLoader(testset,  batch_size=batch_size, shuffle=False, num_workers=2)
     return trainloader, testloader
+
+def load_train_val(batch_size: int = 32, val_split: float = 0.10, seed: int = 42):
+    tf = transforms.Compose([transforms.ToTensor(),
+                             transforms.Normalize((0.1307,), (0.3081,))])
+    full = datasets.MNIST("./data", train=True, download=True, transform=tf)
+    val_size = int(len(full) * val_split)
+    train_size = len(full) - val_size
+    gen = torch.Generator().manual_seed(seed)
+    train_set, val_set = random_split(full, [train_size, val_size], generator=gen)
+    trainloader = DataLoader(train_set, batch_size=batch_size, shuffle=True,  num_workers=2)
+    valloader   = DataLoader(val_set,  batch_size=batch_size, shuffle=False, num_workers=2)
+    return trainloader, valloader
 
 def train_one_epoch(model: nn.Module, loader: DataLoader, lr: float = 0.01, device=DEVICE):
     """Train the model for one epoch."""

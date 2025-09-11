@@ -56,3 +56,7 @@ class Client:
 
     def evaluate(self) -> float:
         return accuracy(self.model, self.testloader, device=DEVICE)
+
+    def evaluate_on(self, loader) -> float:
+        """Evaluate this client's model on a given DataLoader."""
+        return accuracy(self.model, loader, device=DEVICE)
