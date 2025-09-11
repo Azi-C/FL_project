@@ -39,7 +39,7 @@ def run_rounds(
     from client import params_to_numpy, numpy_to_params
     global_params = params_to_numpy(global_model)
 
-    print(f"Starting serverless FL with {num_clients} clients, {len(aggregators)} aggregator-capable nodes")
+    print(f"Starting  FL with {num_clients} clients, {len(aggregators)} aggregator-capable nodes")
     for rnd in range(1, num_rounds + 1):
         print(f"\n=== Round {rnd} ===")
 
