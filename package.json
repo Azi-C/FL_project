@@ -1,0 +1,16 @@
+{
+  "name": "fl_project",
+  "version": "1.0.0",
+  "private": true,
+  "type": "commonjs",
+  "devDependencies": {
+    "hardhat": "^2.26.0",
+    "@nomicfoundation/hardhat-ethers": "^3.1.0"
+  },
+  "scripts": {
+    "compile": "hardhat compile",
+    "node": "hardhat node",
+    "deploy:localhost": "hardhat run --network localhost scripts/deploy.js",
+    "test": "hardhat test"
+  }
+}
