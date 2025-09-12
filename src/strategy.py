@@ -142,7 +142,7 @@ def run_rounds(
         "round", "avg_acc", "chosen_aggregators", "proposal_hashes", "consensus_hash",
         "consensus_votes", "consensus_ok", "fallback_used", "passed", "failed",
         "reputations", "client_sizes", "alpha", "beta", "tau", "gamma_used",
-        "val_acc_prev", "val_acc_new", "delta", "converged"
+        "val_acc_prev", "val_acc_new", "delta", "converged", "hash_votes"
     ]
     ensure_csv(csv_path, csv_fields)
 
@@ -241,8 +241,16 @@ def run_rounds(
         finalized, consensus_hex = chain.get_round(round_id=round_id)
         consensus_hex_norm = normalize_hex(consensus_hex)
 
+        # NEW: collect per-hash votes and print them
+        hash_votes: Dict[str, int] = {}
+        for p in proposals:
+            vcount = chain.get_votes(round_id, "0x" + p["hash"])
+            hash_votes[p["hash"]] = int(vcount)
+            print(f"Votes for {p['hash'][:12]}.. : {vcount}")
+
         consensus_ok = finalized and (consensus_hex_norm != "0" * 64)
         fallback_used = False
+        consensus_votes = -1  # default
 
         if consensus_ok:
             # find winning proposal by hash
@@ -256,14 +264,13 @@ def run_rounds(
                 fallback_used = True
                 print("Consensus hash not found among proposals, falling back to best V-acc.")
             else:
-                print(f"Consensus SUCCESS on-chain: hash={consensus_hex[:12]}..")
+                consensus_votes = hash_votes.get(winner["hash"], -1)
+                print(f"Consensus SUCCESS on-chain: hash={consensus_hex[:12]}.. votes={consensus_votes}")
             aggregated, report = winner["params"], winner["report"]
-            votes = -1  # (optional) query per-hash votes via contract if you need them
         else:
             winner = max(proposals, key=lambda p: p["val_acc"])
             aggregated, report = winner["params"], winner["report"]
             fallback_used = True
-            votes = -1
             print("Consensus FAILED on-chain. Fallback to best V-acc proposal.")
 
         # 6) update reputations (product rule)
@@ -305,14 +312,14 @@ def run_rounds(
         if converged:
             print(f"Converged (|A_t+1 - A_t| < {epsilon}) at round {rnd}.")
 
-        # 9) log CSV
+        # 9) log CSV (now includes hash_votes and real consensus_votes)
         row = {
             "round": rnd,
             "avg_acc": avg_acc,
             "chosen_aggregators": json.dumps(chosen_ids),
             "proposal_hashes": json.dumps([p["hash"] for p in proposals]),
             "consensus_hash": consensus_hex if consensus_ok else "",
-            "consensus_votes": votes,
+            "consensus_votes": consensus_votes,
             "consensus_ok": int(bool(consensus_ok)),
             "fallback_used": int(bool(fallback_used)),
             "passed": json.dumps(sorted([int(cid) for cid, _ in report.get("passed", [])])),
@@ -327,6 +334,7 @@ def run_rounds(
             "val_acc_new": new_val_acc,
             "delta": delta,
             "converged": int(converged),
+            "hash_votes": json.dumps(hash_votes),
         }
         append_csv_row(csv_path, row, csv_fields)
 
