@@ -1,6 +1,4 @@
-# onchain.py
 from __future__ import annotations
-import os
 import json
 import time
 import threading
@@ -11,7 +9,7 @@ from web3 import Web3
 from web3.exceptions import TransactionNotFound, Web3RPCError
 from eth_account import Account
 
-_TX_LOCK = threading.Lock()  # serialize nonces for a single account
+_TX_LOCK = threading.Lock()
 
 @dataclass
 class FLChain:
@@ -31,16 +29,24 @@ class FLChain:
         self.sender = self.account.address
         self.chain_id = self.w3.eth.chain_id
 
-    def _base_fee_tip(self):
-        # Reasonable defaults for Hardhat
-        base = self.w3.eth.gas_price  # works fine on Hardhat
-        prio = int(base * 0.1) or 1
+    def _base_fee_tip(self) -> tuple[int, int]:
+        base = int(self.w3.eth.gas_price)
+        prio = max(1, int(base * 0.1))
         return base + prio, prio
 
+    def _wait_receipt(self, tx_hash, timeout=60.0, poll=0.2):
+        start = time.time()
+        while True:
+            try:
+                return self.w3.eth.get_transaction_receipt(tx_hash)
+            except TransactionNotFound:
+                if time.time() - start > timeout:
+                    raise TimeoutError("Timed out waiting for transaction receipt")
+                time.sleep(poll)
+
     def _send_tx(self, fn, *args, gas: int | None = None, value: int = 0, retries: int = 3):
-        for attempt in range(retries):
+        for _ in range(retries):
             with _TX_LOCK:
-                # Always get pending nonce (automining means no queue)
                 nonce = self.w3.eth.get_transaction_count(self.sender, "pending")
                 max_fee, max_prio = self._base_fee_tip()
                 tx = fn(*args).build_transaction({
@@ -48,7 +54,6 @@ class FLChain:
                     "nonce": nonce,
                     "chainId": self.chain_id,
                     "value": value,
-                    # Legacy fields are fine on Hardhat; we’ll keep EIP-1559-ish gas too
                     "maxFeePerGas": max_fee,
                     "maxPriorityFeePerGas": max_prio,
                     "gas": gas or 4_000_000,
@@ -58,48 +63,26 @@ class FLChain:
                     h = self.w3.eth.send_raw_transaction(signed.raw_transaction)
                 except Web3RPCError as e:
                     msg = (e.args[0].get("message") if e.args and isinstance(e.args[0], dict) else str(e))
-                    if "Nonce too low" in msg or "replacement transaction underpriced" in msg:
-                        # Refresh then retry
+                    if ("Nonce too low" in msg) or ("replacement transaction underpriced" in msg):
                         time.sleep(0.2)
                         continue
                     raise
-
-            # Wait outside the lock so others can build
-            receipt = self._wait_receipt(h)
-            if receipt.status != 1:
+            rcpt = self._wait_receipt(h)
+            if rcpt.status != 1:
                 raise RuntimeError(f"Tx failed: {h.hex()}")
             return h
         raise RuntimeError("Failed to send tx after nonce retries")
 
-    def _wait_receipt(self, tx_hash, timeout=60.0, poll=0.2):
-        start = time.time()
-        while True:
-            try:
-                r = self.w3.eth.get_transaction_receipt(tx_hash)
-                return r
-            except TransactionNotFound:
-                if time.time() - start > timeout:
-                    raise TimeoutError("Timed out waiting for transaction receipt")
-                time.sleep(poll)
-
-    # --- Public API ---
-
+    # -------- public API (matches your coordinator ABI) --------
     def submit_proposal(self, round_id: int, agg_id: int, hash_hex: str):
-        # hash_hex should be '0x' + 64 hex chars
         return self._send_tx(self.contract.functions.submitProposal, round_id, agg_id, hash_hex)
 
     def finalize(self, round_id: int, total_selected: int):
-        return self._send_tx(self.contract.functions.finalizeRound, round_id, total_selected)
+        return self._send_tx(self.contract.functions.finalize, round_id, total_selected)
 
     def get_round(self, round_id: int) -> Tuple[bool, str]:
-        # returns (finalized, winningHash)
         finalized, h = self.contract.functions.getRound(round_id).call()
         return bool(finalized), h
 
     def get_votes(self, round_id: int, hash_hex: str) -> int:
         return int(self.contract.functions.getVotes(round_id, hash_hex).call())
-
-    # onchain.py (add inside FLChain)
-    def begin_round(self, round_id: int):
-        # Solidity fn likely named beginRound(uint256)
-        return self._send_tx(self.contract.functions.beginRound, round_id)
