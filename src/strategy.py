@@ -14,6 +14,8 @@ from persistence import save_json, load_json, save_model_state_dict, ensure_csv,
 from onchain import FLChain
 from storage_chain import FLStorageChain, pack_params_float32
 
+# ---------------- Utilities ----------------
+
 def params_hash(params: List[np.ndarray], decimals: int = 6) -> str:
     h = hashlib.sha256()
     for a in params:
@@ -67,6 +69,8 @@ def fedavg_weighted(client_params: Dict[int, List[np.ndarray]],
             out[j] += (params[j].astype(np.float32) * w)
     return out
 
+# ---------------- Main Orchestrator ----------------
+
 def run_rounds(
     num_clients=6, num_aggregators=4, max_rounds=50, local_epochs=1, lr=0.01,
     tau=1.0, gamma=0.20, k_aggregators=2, non_iid=False, labels_per_client=2,
@@ -76,6 +80,7 @@ def run_rounds(
     total_token_pool=10_000.0, tokens_per_round=100.0,
 ):
     rng = np.random.default_rng(random_seed)
+
     # Build population
     clients: List[Client] = []
     aggregs: List[Aggregator] = []
@@ -96,14 +101,15 @@ def run_rounds(
 
     # Logs
     os.makedirs("artifacts/checkpoints", exist_ok=True)
-    ensure_csv("artifacts/metrics.csv", [
+    csv_fields = [
         "round","avg_acc","chosen_aggregators","proposal_hashes","consensus_hash",
         "consensus_votes","consensus_ok","fallback_used","passed","failed",
         "reputations","client_sizes","alpha","beta","tau","gamma_used",
         "val_acc_prev","val_acc_new","delta","converged","hash_votes",
         "client_chunks","winner_global_chunks","tokens_per_round_used",
         "rewards_this_round","balances_after","remaining_pool",
-    ])
+    ]
+    ensure_csv("artifacts/metrics.csv", csv_fields)
 
     # Initial reputation ∝ data size
     sizes = [c.num_examples() for c in clients]
@@ -130,34 +136,62 @@ def run_rounds(
     while rnd < max_rounds and not converged:
         rnd += 1
         round_id = round_base + rnd
+        next_gamma = min(gamma_cap, current_gamma * gamma_growth)
+
         print(f"\n=== Round {rnd} (on-chain id {round_id}) ===")
-        print(f"Prev global V-accuracy: {prev_val_acc:.4f}")
+        print(f"Gamma now: {current_gamma:.4f}  → next: {next_gamma:.4f} (growth={gamma_growth}, cap={gamma_cap})")
+        print(f"Reputations (start): { {cid: round(reputation[cid], 4) for cid in sorted(reputation)} }")
+        print(f"Prev global V-accuracy: {prev_val_acc:.6f} | ε (convergence) = {epsilon}")
 
-        for c in clients: c.set_params(global_params)
-        for c in clients: c.train_local()
+        # Broadcast global to all
+        for c in clients:
+            c.set_params(global_params)
 
+        # Local training
+        for c in clients:
+            c.train_local()
+
+        # Collect local updates
         client_params = {int(c.cid): c.get_params() for c in clients}
         client_sizes  = {int(c.cid): int(c.num_examples()) for c in clients}
 
+        # Validation gate
         base_acc = accuracy(global_model, valloader)
         valid_ids, failed_ids = [], []
         for c in clients:
             tmp = create_model().to(DEVICE)
             numpy_to_params(tmp, client_params[int(c.cid)])
             acc_i = accuracy(tmp, valloader)
-            (valid_ids if acc_i + 1e-12 >= base_acc * tau else failed_ids).append(int(c.cid))
+            if acc_i + 1e-12 >= base_acc * tau:
+                valid_ids.append(int(c.cid))
+            else:
+                failed_ids.append(int(c.cid))
+
         if not valid_ids:
+            # ensure at least one passes
             best_id, best_acc = int(clients[0].cid), -1.0
             for c in clients:
                 tmp = create_model().to(DEVICE)
                 numpy_to_params(tmp, client_params[int(c.cid)])
                 acc_i = accuracy(tmp, valloader)
                 if acc_i > best_acc: best_acc, best_id = acc_i, int(c.cid)
-            valid_ids = [best_id]; failed_ids = [cid for cid in failed_ids if cid != best_id]
+            if best_id not in valid_ids:
+                valid_ids.append(best_id)
+            failed_ids = [cid for cid in failed_ids if cid != best_id]
 
+        print(f"[Validation gate τ={tau}]  passed={sorted(valid_ids)}  failed={sorted(failed_ids)}")
+
+        # Aggregator eligibility by gamma
+        eligible_by_gamma = [a.cid for a in aggregs if reputation.get(a.cid, 0.0) >= current_gamma]
+        ineligible = [a.cid for a in aggregs if a.cid not in eligible_by_gamma]
+        print(f"[Gamma eligibility]  eligible={sorted(eligible_by_gamma)}  ineligible={sorted(ineligible)}")
+
+        # Select aggregators (uniform from eligible pool)
         chosen = select_aggregators_uniform(reputation, current_gamma, aggregs, k_aggregators, rng)
         chosen_ids = [a.cid for a in chosen]
+        print(f"Chosen aggregator(s) (k={k_aggregators}): {sorted(chosen_ids)}")
 
+        # Build proposals
         proposals = []
         for agg in chosen:
             agg_params = fedavg_weighted(client_params, client_sizes, valid_ids, global_params)
@@ -165,7 +199,9 @@ def run_rounds(
             tmp = create_model().to(DEVICE); numpy_to_params(tmp, agg_params)
             prop_val_acc = accuracy(tmp, valloader)
             proposals.append({"agg_id": agg.cid, "params": agg_params, "hash": h, "val_acc": prop_val_acc})
+            print(f"  • Agg {agg.cid}: hash={h[:12]}..  V-acc={prop_val_acc:.6f}")
 
+        # On-chain proposals + finalize
         for p in proposals:
             chain.submit_proposal(round_id=round_id, agg_id=int(p["agg_id"]), hash_hex="0x" + p["hash"])
         chain.finalize(round_id=round_id, total_selected=len(proposals))
@@ -183,10 +219,13 @@ def run_rounds(
             winner = next((p for p in proposals if normalize_hex(p["hash"]) == consensus_hex_norm), None)
             if winner is None:
                 winner = max(proposals, key=lambda q: q["val_acc"]); fallback_used = True
+                print("Consensus hash not found among proposals → fallback to best V-acc.")
             else:
                 consensus_votes = hash_votes.get(winner["hash"], -1)
+                print(f"Consensus OK: hash={consensus_hex_norm[:12]}.. votes={consensus_votes}")
         else:
             winner = max(proposals, key=lambda p: p["val_acc"]); fallback_used = True
+            print("Consensus FAILED → fallback to best V-acc.")
 
         aggregated = winner["params"]; winner_agg_id = int(winner["agg_id"])
 
@@ -196,28 +235,38 @@ def run_rounds(
             blob = pack_params_float32(params)
             n_chunks, _ = store.upload_blob(round_id, cid, blob, chunk_size=client_chunk_size)
             client_chunks_info[cid] = int(n_chunks)
-
         GLOBAL_NS_OFFSET = 1_000_000
         global_ns_id = GLOBAL_NS_OFFSET + winner_agg_id
         winner_blob = pack_params_float32(aggregated)
         winner_chunks, _ = store.upload_blob(round_id, global_ns_id, winner_blob, chunk_size=global_chunk_size)
 
-        # Reputation update (sign-like)
-        scale = (alpha / (alpha+beta)) * (beta / (alpha+beta))  # same product as before after norm
-        for cid in valid_ids:  reputation[cid] = reputation.get(cid, 0.0) + scale
-        for cid in failed_ids: reputation[cid] = reputation.get(cid, 0.0) - scale
+        # Reputation update (simple sign-based with α, β)
+        s_part_map: Dict[int, int] = {cid: +1 for cid in valid_ids}
+        s_part_map.update({cid: -1 for cid in failed_ids})
+        # Normalize α+β=1 if needed (safe)
+        s = alpha + beta
+        if s <= 0: s = 1.0
+        a_n = alpha / s; b_n = beta / s
+        scale = a_n * b_n
+        for cid, s_part in s_part_map.items():
+            reputation[cid] = reputation.get(cid, 0.0) + (scale * float(s_part))
 
-        # Rewards (proportional to reputation; keep simple as before)
+        print(f"Reputations (updated): { {cid: round(reputation[cid], 4) for cid in sorted(reputation)} }")
+
+        # Rewards (proportional to reputation)
         rep_sum = float(sum(reputation.values())) or 1.0
         rewards_this_round = {int(cid): float(tokens_per_round * (reputation[cid]/rep_sum)) for cid in reputation}
 
-        # Update global and evaluate
+        # Update global and evaluate & convergence
         global_params = aggregated
         numpy_to_params(global_model, global_params)
         new_val_acc = accuracy(global_model, valloader)
         delta = abs(new_val_acc - prev_val_acc)
         converged = (delta < epsilon)
+        print(f"Convergence check: |A(t+1)-A(t)| = {delta:.6f}  < ε={epsilon} ?  {'YES' if converged else 'NO'}")
+        print(f"New global V-accuracy: {new_val_acc:.6f}")
 
+        # Log CSV
         row = {
             "round": rnd,
             "avg_acc": 0.0,
@@ -243,19 +292,21 @@ def run_rounds(
             "balances_after": json.dumps({}),
             "remaining_pool": None,
         }
-        append_csv_row("artifacts/metrics.csv", row, list(row.keys()))
+        append_csv_row("artifacts/metrics.csv", row, csv_fields)
 
         save_json("artifacts/reputation.json", {str(cid): float(r) for cid, r in reputation.items()})
         save_model_state_dict(f"artifacts/checkpoints/round_{rnd:03d}.pt", global_model.state_dict())
 
         prev_val_acc = new_val_acc
-        current_gamma = min(gamma_cap, current_gamma * gamma_growth)
+        print(f"Gamma evolution: {current_gamma:.4f} → {next_gamma:.4f}")
+        current_gamma = next_gamma
+
         if converged:
             break
 
     torch.save(global_model.state_dict(), "global_mnist_cnn.pt")
     print("Done.")
-    
+
 if __name__ == "__main__":
     run_rounds(
         num_clients=6, num_aggregators=4, k_aggregators=2, max_rounds=50,
