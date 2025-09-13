@@ -27,7 +27,6 @@ from storage_chain import FLStorageChain, pack_params_float32
 
 # -------------------- Helpers --------------------
 def params_hash(params: List[np.ndarray], decimals: int = 6) -> str:
-    """Return a hex hash (without 0x) over rounded float32 parameter bytes."""
     h = hashlib.sha256()
     for a in params:
         arr = np.asarray(a, dtype=np.float32)
@@ -86,8 +85,8 @@ def run_rounds(
     random_seed: int = 42,
     gamma_growth: float = 1.05,
     gamma_cap: float = 0.90,
-    client_chunk_size: int = 16*1024,
-    global_chunk_size: int = 16*1024,
+    client_chunk_size: int = 4*1024,   # lowered to 4KB
+    global_chunk_size: int = 4*1024,   # lowered to 4KB
 ):
     if num_clients < 1 or num_aggregators < 1:
         raise ValueError("num_clients and num_aggregators must be >= 1")
@@ -119,14 +118,11 @@ def run_rounds(
                 proportions=proportions, dirichlet_alpha=dirichlet_alpha
             ))
 
-    # Shared validation loader (10% of train)
     valloader = load_validation_loader()
 
-    # Global model
     global_model = create_model().to(DEVICE)
     global_params = params_to_numpy(global_model)
 
-    # Persistence
     reputation_path = "artifacts/reputation.json"
     ckpt_dir = "artifacts/checkpoints"
     csv_path = "artifacts/metrics.csv"
@@ -139,7 +135,6 @@ def run_rounds(
     ]
     ensure_csv(csv_path, csv_fields)
 
-    # Init reputation r0 = |D_i| / sum |D|
     sizes = [c.num_examples() for c in clients]
     total_k = float(sum(sizes)) if sum(sizes) > 0 else 1.0
     reputation: Dict[int, float] = {c.cid: (sizes[i] / total_k) for i, c in enumerate(clients)}
@@ -153,7 +148,6 @@ def run_rounds(
             reputation.update({int(k): float(v) for k, v in loaded_rep.items()})
             print("Loaded existing reputation from disk.")
 
-    # On-chain connectors
     load_dotenv()
     rpc_url = os.getenv("RPC_URL", "http://127.0.0.1:8545")
     coord_addr = os.getenv("CONTRACT_ADDRESS")
@@ -168,13 +162,11 @@ def run_rounds(
     chain = FLChain(rpc_url=rpc_url, contract_address=coord_addr, privkey=privkey)
     store = FLStorageChain(rpc_url=rpc_url, contract_address=storage_addr, privkey=privkey)
 
-    # Use a fresh round index (avoid "Round finalized")
     round_base = first_free_round(chain, start=1) - 1
     print(f"On-chain first free round: {round_base + 1} (using base={round_base})")
 
     current_gamma = float(gamma)
 
-    # Initial V-accuracy
     numpy_to_params(global_model, global_params)
     prev_val_acc = accuracy(global_model, valloader)
 
@@ -189,11 +181,11 @@ def run_rounds(
         print(f"Prev global V-accuracy: {prev_val_acc:.4f}")
         print(f"Gamma used this round: {current_gamma:.4f}")
 
-        # 1) Broadcast current global to all
+        # Broadcast
         for c in clients:
             c.set_params(global_params)
 
-        # 2) Local training + collect updates
+        # Local training
         updates: List[Tuple[int, List]] = []
         for c in clients:
             c.train_local()
@@ -201,7 +193,7 @@ def run_rounds(
         if not updates:
             raise RuntimeError("No client updates collected.")
 
-        # 2b) NEW: store each client's local update on-chain (chunked)
+        # Store each client's local update on-chain (chunked)
         client_chunks_info: Dict[int, int] = {}
         for c in clients:
             blob = pack_params_float32(c.get_params())
@@ -209,20 +201,18 @@ def run_rounds(
             client_chunks_info[int(c.cid)] = int(n_chunks)
         print(f"Uploaded {len(client_chunks_info)} client updates to FLStorage.")
 
-        # 3) Select aggregators (uniform among eligible by reputation)
+        # Select aggregators
         chosen = select_aggregators_uniform(reputation, current_gamma, aggregs, k_aggregators, rng)
         if not chosen:
             raise RuntimeError("No aggregators available; check num_aggregators/k_aggregators.")
         chosen_ids = [a.cid for a in chosen]
         print(f"Chosen aggregator(s): {chosen_ids}")
 
-        # 4) Each chosen aggregator computes proposal (FedAvg) off-chain
+        # Aggregator proposals (hash voting only)
         proposals = []
         for agg in chosen:
             agg_params, report = agg.aggregate(updates, valloader=valloader, clients=clients, tau=tau)
             h = params_hash(agg_params, decimals=6)
-            # NOTE: we NO LONGER upload aggregator proposals to storage here.
-            # Only hashes are used for on-chain voting.
             tmp_model = create_model().to(DEVICE)
             numpy_to_params(tmp_model, agg_params)
             prop_val_acc = accuracy(tmp_model, valloader)
@@ -235,14 +225,13 @@ def run_rounds(
             })
             print(f"Aggregator {agg.cid} -> hash={h[:12]}..  V-acc={prop_val_acc:.4f}")
 
-        # 5) On-chain: submit proposal hashes + finalize majority
+        # On-chain finalize (majority hash)
         for p in proposals:
             chain.submit_proposal(round_id=round_id, agg_id=int(p["agg_id"]), hash_hex="0x" + p["hash"])
         chain.finalize(round_id=round_id, total_selected=len(proposals))
         finalized, consensus_hex = chain.get_round(round_id=round_id)
         consensus_hex_norm = normalize_hex(consensus_hex)
 
-        # Vote counts per hash (for logging)
         hash_votes: Dict[str, int] = {}
         for p in proposals:
             vcount = chain.get_votes(round_id, "0x" + p["hash"])
@@ -275,15 +264,14 @@ def run_rounds(
             fallback_used = True
             print("Consensus FAILED on-chain. Fallback to best V-acc proposal.")
 
-        # 5b) NEW: store ONLY the winner's global model on-chain (chunked)
-        # use special aggId namespace to avoid collision with client IDs
+        # Store ONLY the winner's global model on-chain (chunked)
         GLOBAL_NS_OFFSET = 1_000_000
         global_ns_id = GLOBAL_NS_OFFSET + winner_agg_id
         winner_blob = pack_params_float32(aggregated)
         winner_chunks, _ = store.upload_blob(round_id, global_ns_id, winner_blob, chunk_size=global_chunk_size)
         print(f"Stored winner global model on-chain: agg={winner_agg_id}, chunks={winner_chunks}")
 
-        # 6) Reputation updates (product rule)
+        # Reputation update
         acc_map: Dict[int, float] = {}
         s_part_map: Dict[int, int] = {}
         for cid, a in report.get("passed", []):
@@ -302,14 +290,14 @@ def run_rounds(
               f"Failed on V: {sorted([int(cid) for cid, _ in report.get('failed', [])])}")
         print(f"Reputations (updated): { {cid: round(reputation[cid], 4) for cid in reputation} }")
 
-        # 7) New global, evaluate
+        # New global
         global_params = aggregated
         numpy_to_params(global_model, global_params)
         new_val_acc = accuracy(global_model, valloader)
         delta = abs(new_val_acc - prev_val_acc)
         print(f"New global V-accuracy: {new_val_acc:.4f} | Δ = {delta:.6f}")
 
-        # client-side eval
+        # Client eval
         accs = []
         for c in clients:
             c.set_params(global_params)
@@ -317,12 +305,12 @@ def run_rounds(
         avg_acc = sum(accs) / len(accs)
         print(f"Average client accuracy after round {rnd}: {avg_acc:.4f}")
 
-        # 8) Convergence
+        # Convergence
         converged = (delta < epsilon)
         if converged:
             print(f"Converged (|A_t+1 - A_t| < {epsilon}) at round {rnd}.")
 
-        # 9) CSV log
+        # CSV log
         row = {
             "round": rnd,
             "avg_acc": avg_acc,
@@ -350,11 +338,10 @@ def run_rounds(
         }
         append_csv_row(csv_path, row, csv_fields)
 
-        # 10) Persist reputation / checkpoint
+        # Persist
         save_json(reputation_path, {str(cid): float(r) for cid, r in reputation.items()})
         save_model_state_dict(f"{ckpt_dir}/round_{rnd:03d}.pt", global_model.state_dict())
 
-        # Prep next round
         prev_val_acc = new_val_acc
         current_gamma = min(gamma_cap, current_gamma * gamma_growth)
         print(f"Updated gamma for next round: {current_gamma:.4f}")
@@ -389,6 +376,6 @@ if __name__ == "__main__":
         random_seed=123,
         gamma_growth=1.05,
         gamma_cap=0.90,
-        client_chunk_size=16*1024,
-        global_chunk_size=16*1024,
+        client_chunk_size=4*1024,
+        global_chunk_size=4*1024,
     )

@@ -1,19 +1,17 @@
-import os
+# test_storage.py
+from web3 import Web3
+import json, os
 from dotenv import load_dotenv
-from onchain import FLChain
 
 load_dotenv()
-chain = FLChain(
-    rpc_url=os.getenv("RPC_URL"),
-    contract_address=os.getenv("CONTRACT_ADDRESS"),
-    privkey=os.getenv("PRIVKEY"),
-)
+w3 = Web3(Web3.HTTPProvider(os.getenv("RPC_URL")))
+addr = Web3.to_checksum_address(os.getenv("FLSTORAGE_ADDRESS"))
 
-rnd = 1
-# two aggregators propose the same hash (majority), one proposes different
-chain.submit_proposal(rnd, agg_id=0, hash_hex="0x" + "11"*32)
-chain.submit_proposal(rnd, agg_id=1, hash_hex="0x" + "11"*32)
-chain.submit_proposal(rnd, agg_id=2, hash_hex="0x" + "22"*32)
+print("Code @ FLSTORAGE:", w3.eth.get_code(addr).hex()[:18])  # should not be 0x
 
-chain.finalize(rnd, total_selected=3)
-print("Round state:", chain.get_round(rnd))  # should show the majority hash
+with open("artifacts/contracts/FLStorage.sol/FLStorage.json") as f:
+    abi = json.load(f)["abi"]
+c = w3.eth.contract(address=addr, abi=abi)
+
+# read a view to confirm ABI is correct
+print("Meta(1,1):", c.functions.blobMeta(1,1).call())  # returns tuple of zeros if not begun yet

@@ -1,10 +1,8 @@
 # storage_chain.py
 from web3 import Web3
 import json
-import os
 import math
 import numpy as np
-from dotenv import load_dotenv
 
 def to_checksum(addr: str) -> str:
     return Web3.to_checksum_address(addr)
@@ -21,16 +19,18 @@ class FLStorageChain:
             address=to_checksum(contract_address),
             abi=abi
         )
-
         self.account = self.w3.eth.account.from_key(privkey)
 
     def _tx(self, fn, *args):
+        """Build, estimate gas, sign, and send a state-changing tx."""
         tx = fn(*args).build_transaction({
             "from": self.account.address,
             "nonce": self.w3.eth.get_transaction_count(self.account.address),
-            "gas": 6_000_000,
             "gasPrice": self.w3.to_wei("1", "gwei"),
         })
+        # Dynamic gas estimation with a small safety multiplier
+        gas_est = self.w3.eth.estimate_gas(tx)
+        tx["gas"] = int(gas_est * 1.25)  # 25% headroom
         signed = self.account.sign_transaction(tx)
         h = self.w3.eth.send_raw_transaction(signed.raw_transaction)
         return self.w3.eth.wait_for_transaction_receipt(h)
@@ -59,7 +59,8 @@ class FLStorageChain:
         return self.contract.functions.getChunk(round_id, agg_id, idx).call()
 
     # --- Convenience helpers ---
-    def upload_blob(self, round_id: int, agg_id: int, blob: bytes, chunk_size: int = 16 * 1024):
+    def upload_blob(self, round_id: int, agg_id: int, blob: bytes, chunk_size: int = 4 * 1024):
+        """Upload a blob in small chunks (default 4KB) to reduce per-tx gas."""
         n = math.ceil(len(blob) / chunk_size)
         parts = [blob[i * chunk_size:(i + 1) * chunk_size] for i in range(n)]
         expected = self.rolling_hash(parts)
