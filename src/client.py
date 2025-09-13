@@ -6,7 +6,6 @@ import torch
 from model import create_model
 from utils import (
     load_partition_for_client,
-    load_partition_for_client_non_iid,
     load_validation_loader,
     train_one_epoch,
     accuracy,
@@ -50,7 +49,7 @@ class Client:
         self.model = create_model().to(DEVICE)
 
         if non_iid:
-            self.trainloader = load_partition_for_client_non_iid(
+            self.trainloader = load_partition_for_client(
                 client_id=cid, num_clients=num_clients,
                 labels_per_client=labels_per_client
             )

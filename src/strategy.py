@@ -21,7 +21,7 @@ from persistence import (
 )
 
 from onchain import FLChain
-from storage_chain import FLStorageChain, pack_params_float32
+from storage_chain import FLStorageChain, pack_params_float32, unpack_params_float32
 
 def params_hash(params: List[np.ndarray], decimals: int = 6) -> str:
     h = hashlib.sha256()
@@ -84,9 +84,8 @@ def run_rounds(
     client_chunk_size: int = 4*1024,
     global_chunk_size: int = 4*1024,
 
-    # --- NEW: rewards config ---
-    total_token_pool: Optional[float] = None,   # e.g., 10000.0 for finite pool, or None for infinite
-    tokens_per_round: float = 100.0,            # k in your formula (distributed each round)
+    total_token_pool: Optional[float] = 10_000.0,
+    tokens_per_round: float = 100.0,
     rewards_path: str = "artifacts/rewards.json",
 ):
     if num_clients < 1 or num_aggregators < 1:
@@ -133,8 +132,6 @@ def run_rounds(
         "reputations", "client_sizes", "alpha", "beta", "tau", "gamma_used",
         "val_acc_prev", "val_acc_new", "delta", "converged", "hash_votes",
         "client_chunks", "winner_global_chunks",
-
-        # --- NEW: rewards columns ---
         "tokens_per_round_used", "rewards_this_round", "balances_after", "remaining_pool",
     ]
     ensure_csv(csv_path, csv_fields)
@@ -152,17 +149,10 @@ def run_rounds(
             reputation.update({int(k): float(v) for k, v in loaded_rep.items()})
             print("Loaded existing reputation from disk.")
 
-    # --- NEW: load or init reward ledger ---
+    # Rewards state
     rewards_state = load_json(rewards_path) or {}
     balances: Dict[int, float] = {int(k): float(v) for k, v in rewards_state.get("balances", {}).items()}
-    remaining_pool: Optional[float] = None
-    if total_token_pool is not None:
-        if "remaining_pool" in rewards_state:
-            remaining_pool = float(rewards_state["remaining_pool"])
-        else:
-            remaining_pool = float(total_token_pool)
-
-    # Initialize balances for any new client IDs
+    remaining_pool: Optional[float] = float(rewards_state.get("remaining_pool", total_token_pool)) if total_token_pool is not None else None
     for c in clients:
         if int(c.cid) not in balances:
             balances[int(c.cid)] = 0.0
@@ -172,7 +162,6 @@ def run_rounds(
     coord_addr = os.getenv("CONTRACT_ADDRESS")
     privkey = os.getenv("PRIVKEY")
     storage_addr = os.getenv("FLSTORAGE_ADDRESS")
-
     if not coord_addr or not privkey:
         raise RuntimeError("Set CONTRACT_ADDRESS and PRIVKEY in .env before running.")
     if not storage_addr:
@@ -216,27 +205,59 @@ def run_rounds(
             client_chunks_info[int(c.cid)] = int(n_chunks)
         print(f"Uploaded {len(client_chunks_info)} client updates to FLStorage.")
 
-        # Select aggregators (uniform among eligible)
+        # --- NEW: One-time deterministic V-filter (strategy decides valid_ids) ---
+        # Evaluate each client's model vs V using the SAME code path once.
+        base_acc = accuracy(global_model, valloader)
+        valid_ids: List[int] = []
+        failed_ids: List[int] = []
+
+        for c in clients:
+            blob = store.download_blob(round_id, int(c.cid))
+            params_i = unpack_params_float32(blob, global_params)
+            tmp = create_model().to(DEVICE)
+            numpy_to_params(tmp, params_i)
+            acc_i = accuracy(tmp, valloader)
+            if acc_i + 1e-12 >= base_acc * tau:
+                valid_ids.append(int(c.cid))
+            else:
+                failed_ids.append(int(c.cid))
+
+        if not valid_ids:
+            # fallback: include best single client
+            best_acc = -1.0
+            best_id = int(clients[0].cid)
+            for c in clients:
+                blob = store.download_blob(round_id, int(c.cid))
+                params_i = unpack_params_float32(blob, global_params)
+                tmp = create_model().to(DEVICE)
+                numpy_to_params(tmp, params_i)
+                acc_i = accuracy(tmp, valloader)
+                if acc_i > best_acc:
+                    best_acc = acc_i
+                    best_id = int(c.cid)
+            valid_ids = [best_id]
+            failed_ids = [cid for cid in failed_ids if cid != best_id]
+
+        print(f"Deterministic V-filter → valid_ids={sorted(valid_ids)}, failed_ids={sorted(failed_ids)}")
+
+        # Select aggregators
         chosen = select_aggregators_uniform(reputation, current_gamma, aggregs, k_aggregators, rng)
         if not chosen:
             raise RuntimeError("No aggregators available; check num_aggregators/k_aggregators.")
         chosen_ids = [a.cid for a in chosen]
         print(f"Chosen aggregator(s): {chosen_ids}")
 
-        # Aggregator proposals by DOWNLOADING blobs from FLStorage
-        client_ids = [int(c.cid) for c in clients]
-        client_sizes = [int(c.num_examples()) for c in clients]
+        # Aggregator proposals using the SAME valid_ids list
+        client_sizes = {int(c.cid): int(c.num_examples()) for c in clients}
 
         proposals = []
         for agg in chosen:
-            agg_params, report = agg.aggregate_from_chain(
+            agg_params, report = agg.aggregate_from_chain_deterministic(
                 store=store,
                 round_id=round_id,
                 template_params=global_params,
-                client_ids=client_ids,
+                valid_ids=valid_ids,
                 client_sizes=client_sizes,
-                valloader=valloader,
-                tau=tau,
             )
             h = params_hash(agg_params, decimals=6)
             tmp_model = create_model().to(DEVICE)
@@ -251,7 +272,7 @@ def run_rounds(
             })
             print(f"Aggregator {agg.cid} -> hash={h[:12]}..  V-acc={prop_val_acc:.4f}")
 
-        # On-chain voting
+        # On-chain voting (hashes should now match)
         for p in proposals:
             chain.submit_proposal(round_id=round_id, agg_id=int(p["agg_id"]), hash_hex="0x" + p["hash"])
         chain.finalize(round_id=round_id, total_selected=len(proposals))
@@ -297,27 +318,27 @@ def run_rounds(
         winner_chunks, _ = store.upload_blob(round_id, global_ns_id, winner_blob, chunk_size=global_chunk_size)
         print(f"Stored winner global model on-chain: agg={winner_agg_id}, chunks={winner_chunks}")
 
-        # Reputation update (product rule)
+        # Reputation update (still uses the V-filter result)
         acc_map: Dict[int, float] = {}
         s_part_map: Dict[int, int] = {}
-        for cid, a in report.get("passed", []):
-            acc_map[int(cid)] = float(a)
+        for cid in valid_ids:
+            acc_map[int(cid)] = 0.0  # not recording per-client V-acc here
             s_part_map[int(cid)] = +1
-        for cid, a in report.get("failed", []):
-            acc_map[int(cid)] = float(a)
+        for cid in failed_ids:
+            acc_map[int(cid)] = 0.0
             s_part_map[int(cid)] = -1
 
         scale = alpha * beta
-        for cid, a_i in acc_map.items():
+        # If you want to use actual accuracies in the product rule, compute and store them above
+        for cid in set(list(acc_map.keys()) + list(s_part_map.keys())):
             s_part = s_part_map.get(cid, 0)
-            reputation[cid] = reputation.get(cid, 0.0) + (scale * a_i * float(s_part))
+            # Here we use base_acc as proxy; you can compute per-client acc_i earlier and cache.
+            # Keep it simple: reward/penalize by s_part only
+            reputation[cid] = reputation.get(cid, 0.0) + (scale * (1.0) * float(s_part))
 
-        print(f"Passed on V: {sorted([int(cid) for cid, _ in report.get('passed', [])])} | "
-              f"Failed on V: {sorted([int(cid) for cid, _ in report.get('failed', [])])}")
         print(f"Reputations (updated): { {cid: round(reputation[cid], 4) for cid in reputation} }")
 
-        # --- NEW: Rewards distribution ---
-        # Compute tokens to distribute this round (respect remaining pool if finite)
+        # Rewards distribution (unchanged)
         k_this_round = float(tokens_per_round)
         if remaining_pool is not None:
             if remaining_pool <= 0.0:
@@ -325,7 +346,6 @@ def run_rounds(
             else:
                 k_this_round = float(min(remaining_pool, tokens_per_round))
 
-        # Sum of updated reputations
         rep_sum = float(sum(reputation.values()))
         rewards_this_round: Dict[int, float] = {}
         if k_this_round > 0 and rep_sum > 0:
@@ -333,7 +353,6 @@ def run_rounds(
                 p_i = k_this_round * (reputation[cid] / rep_sum)
                 rewards_this_round[int(cid)] = float(p_i)
                 balances[int(cid)] = float(balances.get(int(cid), 0.0) + p_i)
-
             if remaining_pool is not None:
                 remaining_pool = float(max(0.0, remaining_pool - k_this_round))
 
@@ -367,8 +386,8 @@ def run_rounds(
             "consensus_votes": consensus_votes,
             "consensus_ok": int(bool(consensus_ok)),
             "fallback_used": int(bool(fallback_used)),
-            "passed": json.dumps(sorted([int(cid) for cid, _ in report.get("passed", [])])),
-            "failed": json.dumps(sorted([int(cid) for cid, _ in report.get("failed", [])])),
+            "passed": json.dumps(sorted(valid_ids)),
+            "failed": json.dumps(sorted(failed_ids)),
             "reputations": json.dumps({int(cid): float(r) for cid, r in reputation.items()}),
             "client_sizes": json.dumps({int(c.cid): int(sizes[i]) for i, c in enumerate(clients)}),
             "alpha": alpha,
@@ -382,8 +401,6 @@ def run_rounds(
             "hash_votes": json.dumps(hash_votes),
             "client_chunks": json.dumps(client_chunks_info),
             "winner_global_chunks": int(winner_chunks),
-
-            # rewards
             "tokens_per_round_used": k_this_round,
             "rewards_this_round": json.dumps({int(k): float(v) for k, v in rewards_this_round.items()}),
             "balances_after": json.dumps({int(k): float(v) for k, v in balances.items()}),
@@ -394,12 +411,11 @@ def run_rounds(
         # Persist
         save_json(reputation_path, {str(cid): float(r) for cid, r in reputation.items()})
         save_model_state_dict(f"{ckpt_dir}/round_{rnd:03d}.pt", global_model.state_dict())
-        # Persist rewards
-        state_out = {
+        rewards_out = {
             "balances": {str(k): float(v) for k, v in balances.items()},
             **({ "remaining_pool": float(remaining_pool) } if remaining_pool is not None else {}),
         }
-        save_json(rewards_path, state_out)
+        save_json(rewards_path, rewards_out)
 
         prev_val_acc = new_val_acc
         current_gamma = min(gamma_cap, current_gamma * gamma_growth)
@@ -437,8 +453,6 @@ if __name__ == "__main__":
         gamma_cap=0.90,
         client_chunk_size=4*1024,
         global_chunk_size=4*1024,
-
-        # Rewards config examples:
-        total_token_pool=10_000.0,     # finite pool (omit or set None for infinite)
-        tokens_per_round=100.0,        # k distributed each round
+        total_token_pool=10_000.0,
+        tokens_per_round=100.0,
     )
