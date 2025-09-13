@@ -3,6 +3,7 @@ from web3 import Web3
 import json
 import math
 import numpy as np
+from typing import List
 
 def to_checksum(addr: str) -> str:
     return Web3.to_checksum_address(addr)
@@ -28,9 +29,8 @@ class FLStorageChain:
             "nonce": self.w3.eth.get_transaction_count(self.account.address),
             "gasPrice": self.w3.to_wei("1", "gwei"),
         })
-        # Dynamic gas estimation with a small safety multiplier
         gas_est = self.w3.eth.estimate_gas(tx)
-        tx["gas"] = int(gas_est * 1.25)  # 25% headroom
+        tx["gas"] = int(gas_est * 1.25)  # headroom
         signed = self.account.sign_transaction(tx)
         h = self.w3.eth.send_raw_transaction(signed.raw_transaction)
         return self.w3.eth.wait_for_transaction_receipt(h)
@@ -89,6 +89,23 @@ class FLStorageChain:
         return b"".join(parts)
 
 
-# --- Parameter packing helper (float32) ---
+# --- Parameter packing/unpacking helpers (float32) ---
+
 def pack_params_float32(params: list[np.ndarray]) -> bytes:
+    """Flatten and pack a list of float32 arrays into bytes."""
     return b"".join([np.asarray(p, dtype=np.float32).tobytes(order="C") for p in params])
+
+def unpack_params_float32(blob: bytes, template_params: List[np.ndarray]) -> List[np.ndarray]:
+    """Unpack bytes into a list of arrays matching template shapes/dtypes (float32)."""
+    params: List[np.ndarray] = []
+    offset = 0
+    for t in template_params:
+        arr = np.asarray(t, dtype=np.float32)
+        nbytes = arr.size * 4  # float32
+        chunk = blob[offset: offset + nbytes]
+        assert len(chunk) == nbytes, "blob too short for template shape"
+        p = np.frombuffer(chunk, dtype=np.float32).reshape(arr.shape).copy()
+        params.append(p)
+        offset += nbytes
+    assert offset == len(blob), "blob has extra bytes"
+    return params
