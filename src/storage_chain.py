@@ -98,7 +98,7 @@ class FLStorageChain:
         tx_hashes = []
         n = (len(blob) + chunk_size - 1) // chunk_size
         for i in range(n):
-            part = blob[i*chunk_size:(i+1)*chunkSize]
+            part = blob[i*chunk_size:(i+1)*chunk_size]
             h = self.put_chunk(round_id, writer_id, i, part)
             tx_hashes.append(h.hex())
         return n, tx_hashes
