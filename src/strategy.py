@@ -12,7 +12,7 @@ from aggregator import Aggregator
 from utils import DEVICE, load_validation_loader, accuracy, params_to_numpy, numpy_to_params
 from persistence import save_json, load_json, save_model_state_dict, ensure_csv, append_csv_row
 from onchain import FLChain
-from storage_chain import FLStorageChain, pack_params_float32
+from storage_chain import FLStorageChain, pack_params_float32, unpack_params_float32
 
 # ---------------- Utilities ----------------
 
@@ -97,7 +97,7 @@ def run_rounds(
 
     valloader = load_validation_loader()
     global_model = create_model().to(DEVICE)
-    global_params = params_to_numpy(global_model)
+    global_params = params_to_numpy(global_model)  # template for shapes
 
     # Logs
     os.makedirs("artifacts/checkpoints", exist_ok=True)
@@ -129,8 +129,43 @@ def run_rounds(
 
     chain = FLChain(rpc_url=rpc_url, contract_address=coord_addr, privkey=privkey)
     store = FLStorageChain(rpc_url=rpc_url, contract_address=storage_addr, privkey=privkey)
+
+    # Find first free on-chain round, then use (round_base) as "Round 0" to store baseline
     round_base = first_free_round(chain, start=1) - 1
+    print(f"On-chain first free round will be: {round_base + 1}")
+    print(f"Storing baseline (Round 0) under round_id={round_base}")
+
+    # ---- Store baseline global model on-chain (Round 0) ----
+    baseline_hash = params_hash(global_params, decimals=6)
+    GLOBAL_NS_OFFSET = 1_000_000
+    baseline_ns_id = GLOBAL_NS_OFFSET + 0  # writer namespace for baseline
+    baseline_blob = pack_params_float32(global_params)
+    baseline_chunks, _ = store.upload_blob(round_base, baseline_ns_id, baseline_blob, chunk_size=global_chunk_size)
+    print(f"[Baseline] hash={baseline_hash[:12]}..  chunks={baseline_chunks}  ns_id={baseline_ns_id}")
+
+    # Let EACH CLIENT download the baseline from storage and load it
+    for c in clients:
+        c.sync_from_storage(
+            store=store,
+            round_id=round_base,
+            writer_id=baseline_ns_id,
+            template=global_params,
+            chunk_size=global_chunk_size,
+        )
+
+    # Manager also loads baseline for evaluation
+    blob0 = store.download_blob(round_base, baseline_ns_id, chunk_size=global_chunk_size)
+    downloaded_global_params = unpack_params_float32(blob0, template=global_params)
+    numpy_to_params(global_model, downloaded_global_params)
+    global_params = downloaded_global_params
+
+    # Also checkpoint baseline locally
+    save_model_state_dict("artifacts/checkpoints/round_000.pt", global_model.state_dict())
     prev_val_acc = accuracy(global_model, valloader)
+
+    # Track the current "authoritative" global (where clients must pull from)
+    current_global_round_id = round_base
+    current_global_writer_ns = baseline_ns_id
 
     converged, rnd, current_gamma = False, 0, float(gamma)
     while rnd < max_rounds and not converged:
@@ -143,9 +178,22 @@ def run_rounds(
         print(f"Reputations (start): { {cid: round(reputation[cid], 4) for cid in sorted(reputation)} }")
         print(f"Prev global V-accuracy: {prev_val_acc:.6f} | ε (convergence) = {epsilon}")
 
-        # Broadcast global to all
+        # --- PULL current global from chain (manager + each client) ---
+        # Manager pull (for evaluation/convergence):
+        mgr_blob = store.download_blob(current_global_round_id, current_global_writer_ns, chunk_size=global_chunk_size)
+        mgr_global_params = unpack_params_float32(mgr_blob, template=global_params)
+        numpy_to_params(global_model, mgr_global_params)
+        global_params = mgr_global_params  # keep template in sync
+
+        # Each client pulls from chain:
         for c in clients:
-            c.set_params(global_params)
+            c.sync_from_storage(
+                store=store,
+                round_id=current_global_round_id,
+                writer_id=current_global_writer_ns,
+                template=global_params,
+                chunk_size=global_chunk_size,
+            )
 
         # Local training
         for c in clients:
@@ -155,7 +203,7 @@ def run_rounds(
         client_params = {int(c.cid): c.get_params() for c in clients}
         client_sizes  = {int(c.cid): int(c.num_examples()) for c in clients}
 
-        # Validation gate
+        # Validation gate (τ)
         base_acc = accuracy(global_model, valloader)
         valid_ids, failed_ids = [], []
         for c in clients:
@@ -235,6 +283,7 @@ def run_rounds(
             blob = pack_params_float32(params)
             n_chunks, _ = store.upload_blob(round_id, cid, blob, chunk_size=client_chunk_size)
             client_chunks_info[cid] = int(n_chunks)
+
         GLOBAL_NS_OFFSET = 1_000_000
         global_ns_id = GLOBAL_NS_OFFSET + winner_agg_id
         winner_blob = pack_params_float32(aggregated)
@@ -243,7 +292,6 @@ def run_rounds(
         # Reputation update (simple sign-based with α, β)
         s_part_map: Dict[int, int] = {cid: +1 for cid in valid_ids}
         s_part_map.update({cid: -1 for cid in failed_ids})
-        # Normalize α+β=1 if needed (safe)
         s = alpha + beta
         if s <= 0: s = 1.0
         a_n = alpha / s; b_n = beta / s
@@ -257,7 +305,7 @@ def run_rounds(
         rep_sum = float(sum(reputation.values())) or 1.0
         rewards_this_round = {int(cid): float(tokens_per_round * (reputation[cid]/rep_sum)) for cid in reputation}
 
-        # Update global and evaluate & convergence
+        # Update global and evaluate & convergence (manager uses in-memory copy)
         global_params = aggregated
         numpy_to_params(global_model, global_params)
         new_val_acc = accuracy(global_model, valloader)
@@ -300,6 +348,10 @@ def run_rounds(
         prev_val_acc = new_val_acc
         print(f"Gamma evolution: {current_gamma:.4f} → {next_gamma:.4f}")
         current_gamma = next_gamma
+
+        # **Advance the authoritative on-chain source for next round pulls**
+        current_global_round_id = round_id
+        current_global_writer_ns = global_ns_id
 
         if converged:
             break
