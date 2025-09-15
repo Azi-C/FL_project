@@ -1,24 +1,25 @@
 from __future__ import annotations
 import os
 import time
-import json
 import hashlib
-from typing import Dict, List, Optional
+import random
+import argparse
+from typing import List, Optional
 
 import numpy as np
 import torch
 from dotenv import load_dotenv
 
-from client import Client
-from model import create_model
-from utils import DEVICE, load_validation_loader, accuracy, params_to_numpy, numpy_to_params
-from onchain import FLChain
-from storage_chain import FLStorageChain, pack_params_float32, unpack_params_float32
+from src.client import Client
+from src.model import create_model
+from src.utils import DEVICE, load_validation_loader, accuracy, params_to_numpy, numpy_to_params
+from src.onchain import FLChain
+from src.storage_chain import FLStorageChain, pack_params_float32, unpack_params_float32
 
 GLOBAL_NS_OFFSET = 1_000_000  # namespace for winner globals: GLOBAL_NS_OFFSET + agg_id
 
 
-# ---------- Small helpers ----------
+# ---------- Helpers ----------
 
 def sha256_params(params: List[np.ndarray], decimals: int = 6) -> str:
     h = hashlib.sha256()
@@ -44,7 +45,10 @@ def first_free_round(chain: FLChain, start: int = 1, max_scan: int = 100000) -> 
         r += 1
     raise RuntimeError("No free round found")
 
-def try_download_params(store: FLStorageChain, round_id: int, writer_id: int, template: List[np.ndarray], chunk_size: int) -> Optional[List[np.ndarray]]:
+def try_download_params(
+    store: FLStorageChain, round_id: int, writer_id: int,
+    template: List[np.ndarray], chunk_size: int
+) -> Optional[List[np.ndarray]]:
     try:
         blob = store.download_blob(round_id, writer_id, chunk_size=chunk_size)
         return unpack_params_float32(blob, template)
@@ -52,7 +56,7 @@ def try_download_params(store: FLStorageChain, round_id: int, writer_id: int, te
         return None
 
 def fedavg_equal_weight(param_list: List[List[np.ndarray]], template: List[np.ndarray]) -> List[np.ndarray]:
-    """Simple FedAvg with equal weights (works without knowing |D_i| of others)."""
+    """Simple FedAvg with equal weights."""
     if not param_list:
         raise ValueError("No params to average")
     out = [np.zeros_like(p, dtype=np.float32) for p in template]
@@ -62,176 +66,205 @@ def fedavg_equal_weight(param_list: List[List[np.ndarray]], template: List[np.nd
             out[j] += params[j].astype(np.float32) / n
     return out
 
-# If you later publish |D_i| sizes per client (on-chain or via index),
-# you can switch to weighted FedAvg by sizes.
+def deterministic_proposers(round_id: int, num_clients: int, k_proposers: int) -> List[int]:
+    """Pick K proposers deterministically using round_id as RNG seed."""
+    k = max(1, min(k_proposers, num_clients))
+    rng = np.random.default_rng(seed=round_id)
+    choices = rng.choice(num_clients, size=k, replace=False)
+    return sorted(int(x) for x in choices)
+
+
+# ---------- CLI ARG PARSER ----------
+
+def parse_args():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--id", type=int, help="Client ID (0..NUM_CLIENTS-1)")
+    return parser.parse_args()
 
 
 # ---------- Peer main loop ----------
 
 def main():
-    load_dotenv()
+    args = parse_args()
+
+    # If --id is provided, auto-pick .env.clientX
+    if args.id is not None:
+        env_file = f".env.client{args.id}"
+    else:
+        env_file = os.getenv("ENV_FILE") or ".env"
+
+    load_dotenv(env_file)
+    print(f"[peer] Loaded config from {env_file}")
 
     # --- Env/config ---
-    rpc_url   = os.getenv("RPC_URL", "http://127.0.0.1:8545")
+    rpc_url    = os.getenv("RPC_URL", "http://127.0.0.1:8545")
     coord_addr = os.getenv("CONTRACT_ADDRESS")
     store_addr = os.getenv("FLSTORAGE_ADDRESS")
-    privkey    = os.getenv("PRIVKEY")  # this peer's signer
+    privkey    = os.getenv("PRIVKEY")
     if not (coord_addr and store_addr and privkey):
-        raise RuntimeError("Set CONTRACT_ADDRESS, FLSTORAGE_ADDRESS, PRIVKEY in .env")
+        raise RuntimeError("Set CONTRACT_ADDRESS, FLSTORAGE_ADDRESS, PRIVKEY")
 
-    # Peer identity / dataset
-    CLIENT_ID    = int(os.getenv("CLIENT_ID", "0"))
+    CLIENT_ID    = int(os.getenv("CLIENT_ID", args.id or 0))
     NUM_CLIENTS  = int(os.getenv("NUM_CLIENTS", "6"))
     LOCAL_EPOCHS = int(os.getenv("LOCAL_EPOCHS", "1"))
     LR           = float(os.getenv("LR", "0.01"))
 
-    # Policy / thresholds
-    TAU          = float(os.getenv("TAU", "1.0"))    # validation gate
-    GAMMA        = float(os.getenv("GAMMA", "0.20")) # aggregator eligibility
-    K_AGG        = int(os.getenv("K_AGGREGATORS", "2"))
-    EPSILON      = float(os.getenv("EPSILON", "1e-3"))
+    # Policy
+    TAU         = float(os.getenv("TAU", "1.0"))
+    EPSILON     = float(os.getenv("EPSILON", "1e-3"))
+    K_PROPOSERS = int(os.getenv("K_PROPOSERS", "2"))
 
-    # Chunk sizes for FLStorage
+    ROUND_WINDOW_SEC    = int(os.getenv("ROUND_WINDOW_SEC", "5"))
+    PROPOSAL_JITTER_SEC = float(os.getenv("PROPOSAL_JITTER_SEC", "0.5"))
+    FINALIZE_DELAY_SEC  = float(os.getenv("FINALIZE_DELAY_SEC", "1.5"))
+    IDLE_SLEEP_SEC      = float(os.getenv("IDLE_SLEEP_SEC", "2.0"))
+
+    MAX_ROUNDS = int(os.getenv("MAX_ROUNDS", "0"))
+
     CLIENT_CHUNK = int(os.getenv("CLIENT_CHUNK", str(4 * 1024)))
     GLOBAL_CHUNK = int(os.getenv("GLOBAL_CHUNK", str(4 * 1024)))
 
-    # Instantiate chain handles
+    # Chain handles
     chain = FLChain(rpc_url=rpc_url, contract_address=coord_addr, privkey=privkey)
     store = FLStorageChain(rpc_url=rpc_url, contract_address=store_addr, privkey=privkey)
 
-    # Local data/model
-    client = Client(cid=CLIENT_ID, num_clients=NUM_CLIENTS, lr=LR, local_epochs=LOCAL_EPOCHS,
-                    non_iid=False, labels_per_client=2, proportions=None, dirichlet_alpha=None)
+    # Local client
+    client = Client(
+        cid=CLIENT_ID,
+        num_clients=NUM_CLIENTS,
+        lr=LR,
+        local_epochs=LOCAL_EPOCHS,
+        non_iid=False,
+        labels_per_client=2,
+        proportions=None,
+        dirichlet_alpha=None,
+    )
 
     valloader = load_validation_loader()
-    manager_model = create_model().to(DEVICE)  # for local evaluation; same as global template
+    manager_model = create_model().to(DEVICE)
     template_params = params_to_numpy(manager_model)
 
-    # --- Baseline pull (Round 0) ---
-    # We assume Round 0 baseline is already stored by someone under writer_id=(GLOBAL_NS_OFFSET+0)
-    # If not present, the cluster needs one bootstrapper (e.g., CLIENT_ID==0) to upload it.
-    round_free = first_free_round(chain, start=1)      # first not-finalized round on-chain
-    round_base = round_free - 1                        # previous slot is where baseline or last winner lives
+    # --- Baseline (Round 0) ---
+    round_free = first_free_round(chain, start=1)
+    round_base = round_free - 1
 
-    # Try to pull baseline (writer_id = GLOBAL_NS_OFFSET + 0)
     baseline_params = try_download_params(store, round_base, GLOBAL_NS_OFFSET + 0, template_params, GLOBAL_CHUNK)
     if baseline_params is None and CLIENT_ID == 0:
-        # bootstrap: CLIENT 0 creates a deterministic baseline and uploads
-        print(f"[peer {CLIENT_ID}] Baseline missing → bootstrapping Round 0 baseline")
-        baseline_params = template_params  # model initialized already
+        print(f"[peer {CLIENT_ID}] Baseline missing → bootstrapping")
+        baseline_params = template_params
         blob = pack_params_float32(baseline_params)
         store.upload_blob(round_base, GLOBAL_NS_OFFSET + 0, blob, chunk_size=GLOBAL_CHUNK)
     elif baseline_params is None:
-        print(f"[peer {CLIENT_ID}] Waiting for baseline on-chain... (another peer should upload)")
-        # Wait loop until baseline appears
+        print(f"[peer {CLIENT_ID}] Waiting for baseline...")
         while baseline_params is None:
             time.sleep(2)
             baseline_params = try_download_params(store, round_base, GLOBAL_NS_OFFSET + 0, template_params, GLOBAL_CHUNK)
 
-    # Load baseline into our eval model and local client model
     for m in (manager_model, client.model):
         numpy_to_params(m, baseline_params)
 
     prev_val_acc = accuracy(manager_model, valloader)
-    print(f"[peer {CLIENT_ID}] Pulled baseline (Round 0). Prev V-acc = {prev_val_acc:.4f}")
+    print(f"[peer {CLIENT_ID}] Baseline V-acc = {prev_val_acc:.4f}")
 
-    # ---- Main peer loop ----
-    # This loop processes one on-chain round at a time.
-    # It is safe if multiple peers run concurrently: the contracts are the source of truth.
+    rounds_done = 0
+
+    # --- Main loop ---
     while True:
         try:
-            # Determine the current work round
-            r = first_free_round(chain, start=1)  # treat this as the round we’ll propose/finalize
-            pull_round = r - 1                    # authoritative global lives in previous round
-            # Find which writer_id hosts the winner global of (r-1).
-            # Convention: writer_id = GLOBAL_NS_OFFSET + agg_id
-            # We discover it by matching hash with consensus hash if (r-1) was finalized.
+            if MAX_ROUNDS > 0 and rounds_done >= MAX_ROUNDS:
+                print(f"[peer {CLIENT_ID}] Reached MAX_ROUNDS={MAX_ROUNDS} — stopping.")
+                break
+
+            r = first_free_round(chain, start=1)
+            pull_round = r - 1
+
             finalized_prev, consensus_hex = chain.get_round(pull_round)
             consensus_hex_norm = normalize_hex(consensus_hex) if finalized_prev else None
 
-            # Attempt to pull the authoritative global for pull_round:
             pulled = None
-            if finalized_prev and consensus_hex_norm and consensus_hex_norm != "0"*64:
-                # Try all possible writer namespaces (GLOBAL_NS_OFFSET + client_id)
+            if finalized_prev and consensus_hex_norm and consensus_hex_norm != "0" * 64:
                 for cid in range(NUM_CLIENTS):
                     params = try_download_params(store, pull_round, GLOBAL_NS_OFFSET + cid, template_params, GLOBAL_CHUNK)
-                    if params is None:
-                        continue
-                    if sha256_params(params, decimals=6) == consensus_hex_norm:
+                    if params is not None and sha256_params(params, 6) == consensus_hex_norm:
                         pulled = params
-                        print(f"[peer {CLIENT_ID}] Pulled previous winner from writer_ns={GLOBAL_NS_OFFSET+cid}")
+                        print(f"[peer {CLIENT_ID}] Pulled winner from writer_ns={GLOBAL_NS_OFFSET + cid}")
                         break
-            # Fallback: use baseline if previous round not finalized (first round)
             if pulled is None:
                 pulled = try_download_params(store, pull_round, GLOBAL_NS_OFFSET + 0, template_params, GLOBAL_CHUNK)
                 if pulled is None:
-                    print(f"[peer {CLIENT_ID}] Waiting for authoritative global at round {pull_round}...")
-                    time.sleep(2)
+                    print(f"[peer {CLIENT_ID}] Waiting for global at round {pull_round}...")
+                    time.sleep(IDLE_SLEEP_SEC)
                     continue
 
-            # Load pulled global into local models
             numpy_to_params(manager_model, pulled)
             client.set_params(pulled)
 
             # Local training
             client.train_local()
 
-            # τ gate: compare local update vs pulled global on V
+            # τ-gate
             base_acc = accuracy(manager_model, valloader)
             tmp = create_model().to(DEVICE)
             numpy_to_params(tmp, client.get_params())
             acc_i = accuracy(tmp, valloader)
-            passed_tau = (acc_i + 1e-12) >= (base_acc * TAU)
-            print(f"[peer {CLIENT_ID}] τ-gate: base={base_acc:.4f} | mine={acc_i:.4f} | passed={passed_tau}")
+            print(f"[peer {CLIENT_ID}] τ-gate: base={base_acc:.4f} | mine={acc_i:.4f}")
 
-            # Upload local update to FLStorage for this round
+            # Upload update
             my_params = client.get_params()
             my_blob = pack_params_float32(my_params)
             store.upload_blob(r, client.cid, my_blob, chunk_size=CLIENT_CHUNK)
-            print(f"[peer {CLIENT_ID}] Uploaded local update for round {r}")
+            print(f"[peer {CLIENT_ID}] Uploaded update for round {r}")
 
-            # If eligible aggregator (simple check: reputation/γ not tracked on-chain here),
-            # you can approximate eligibility off-chain or allow anyone to propose.
-            # For now, allow anyone to try proposing; the chain's consensus will pick majority.
-            # Discover other updates (best-effort: try all client ids)
-            candidate_params: List[List[np.ndarray]] = []
-            submitters = []
+            time.sleep(ROUND_WINDOW_SEC)
+
+            # Collect updates
+            candidate_params = []
             for cid in range(NUM_CLIENTS):
                 p = try_download_params(store, r, cid, template_params, CLIENT_CHUNK)
-                if p is None:
-                    continue
-                # τ check for others (optional): skip if they fail; we only have our local V
-                # Here we accept all present updates to keep things moving.
-                candidate_params.append(p)
-                submitters.append(cid)
+                if p is not None:
+                    candidate_params.append(p)
 
-            if candidate_params:
+            if not candidate_params:
+                time.sleep(IDLE_SLEEP_SEC)
+                continue
+
+            # Deterministic proposers
+            proposers = deterministic_proposers(r, NUM_CLIENTS, K_PROPOSERS)
+            if CLIENT_ID in proposers:
                 agg_params = fedavg_equal_weight(candidate_params, template_params)
                 h = sha256_params(agg_params, decimals=6)
-                print(f"[peer {CLIENT_ID}] Proposing hash={h[:12]}.. using {len(candidate_params)} updates")
-                chain.submit_proposal(round_id=r, agg_id=client.cid, hash_hex="0x" + h)
-                # Try finalize (idempotent; ok if someone else does it too)
-                try:
-                    chain.finalize(round_id=r, total_selected=1)  # we propose 1; many peers may also propose
-                except Exception:
-                    pass
 
-                # If our hash wins, upload winner global (so next round can pull it)
+                time.sleep(random.uniform(0.0, PROPOSAL_JITTER_SEC))
+                chain.submit_proposal(round_id=r, agg_id=client.cid, hash_hex="0x" + h)
+                print(f"[peer {CLIENT_ID}] Submitted proposal {h[:12]}..")
+
+                if CLIENT_ID == proposers[0]:
+                    time.sleep(FINALIZE_DELAY_SEC)
+                    try:
+                        chain.finalize(round_id=r, total_selected=len(proposers))
+                        print(f"[peer {CLIENT_ID}] Finalized round {r}")
+                    except Exception as e:
+                        print(f"[peer {CLIENT_ID}] finalize error: {e}")
+
                 finalized, consensus_hex = chain.get_round(r)
                 if finalized and normalize_hex(consensus_hex) == h:
                     g_blob = pack_params_float32(agg_params)
                     store.upload_blob(r, GLOBAL_NS_OFFSET + client.cid, g_blob, chunk_size=GLOBAL_CHUNK)
-                    print(f"[peer {CLIENT_ID}] Our proposal WON. Uploaded winner global (writer_ns={GLOBAL_NS_OFFSET+client.cid}).")
+                    print(f"[peer {CLIENT_ID}] Our proposal WON. Uploaded winner global.")
 
-                # Local convergence tracking (optional)
+                # Convergence check
                 numpy_to_params(manager_model, agg_params)
                 new_acc = accuracy(manager_model, valloader)
                 delta = abs(new_acc - prev_val_acc)
-                print(f"[peer {CLIENT_ID}] ΔV-acc={delta:.6f} (ε={EPSILON}) → {'STOP' if delta < EPSILON else 'CONTINUE'}")
+                print(f"[peer {CLIENT_ID}] ΔV-acc={delta:.6f} (ε={EPSILON})")
                 prev_val_acc = new_acc
 
-            # Small pause before next iteration
-            time.sleep(2)
+                if delta < EPSILON:
+                    print(f"[peer {CLIENT_ID}] Converged — stopping.")
+                    break
+
+            rounds_done += 1
+            time.sleep(IDLE_SLEEP_SEC)
 
         except KeyboardInterrupt:
             print(f"[peer {CLIENT_ID}] stopping...")
