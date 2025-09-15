@@ -1,152 +1,118 @@
-import torch
-from torch.utils.data import DataLoader, random_split
-from torchvision import datasets, transforms
+from __future__ import annotations
+
+from typing import Iterable, List, Tuple
+
 import numpy as np
-from typing import List, Tuple, Optional
+import torch
+from torch.utils.data import DataLoader, Subset, random_split
+from torchvision import datasets, transforms
+
+# ------------------ Device ------------------
 
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-# --------------------------
-# Dataset loading utilities
-# --------------------------
 
-def load_data(batch_size: int = 32) -> Tuple[DataLoader, DataLoader]:
-    """Load MNIST train/test datasets."""
-    tf = transforms.Compose([
+# ------------------ Data ------------------
+
+def _mnist_transform():
+    return transforms.Compose([
         transforms.ToTensor(),
-        transforms.Normalize((0.1307,), (0.3081,))
+        transforms.Normalize((0.1307,), (0.3081,)),
     ])
-    trainset = datasets.MNIST("./data", train=True, download=True, transform=tf)
-    testset = datasets.MNIST("./data", train=False, download=True, transform=tf)
-    trainloader = DataLoader(trainset, batch_size=batch_size, shuffle=True, num_workers=2)
-    testloader = DataLoader(testset, batch_size=batch_size, shuffle=False, num_workers=2)
-    return trainloader, testloader
 
 
-def load_train_val(batch_size: int = 32, val_split: float = 0.10, seed: int = 42) -> Tuple[DataLoader, DataLoader]:
-    """Split MNIST train into train/validation loaders."""
-    tf = transforms.Compose([
-        transforms.ToTensor(),
-        transforms.Normalize((0.1307,), (0.3081,))
-    ])
-    full = datasets.MNIST("./data", train=True, download=True, transform=tf)
-    val_size = int(len(full) * val_split)
-    train_size = len(full) - val_size
-    gen = torch.Generator().manual_seed(seed)
-    train_set, val_set = random_split(full, [train_size, val_size], generator=gen)
-    trainloader = DataLoader(train_set, batch_size=batch_size, shuffle=True, num_workers=2)
-    valloader = DataLoader(val_set, batch_size=batch_size, shuffle=False, num_workers=2)
-    return trainloader, valloader
+def load_validation_loader(batch_size: int = 64) -> DataLoader:
+    """Shared validation loader (MNIST test set)."""
+    testset = datasets.MNIST(root="./data", train=False, download=True, transform=_mnist_transform())
+    return DataLoader(testset, batch_size=batch_size, shuffle=False, num_workers=2)
 
-
-def load_validation_loader(batch_size: int = 32) -> DataLoader:
-    """Return only the validation dataset (10% of MNIST train)."""
-    _, valloader = load_train_val(batch_size=batch_size, val_split=0.10)
-    return valloader
-
-
-# --------------------------
-# Partitioning for clients
-# --------------------------
 
 def load_partition_for_client(
-    cid: int,
+    client_id: int,
     num_clients: int,
     batch_size: int = 32,
-    non_iid: bool = False,
-    labels_per_client: int = 2,
-    proportions: Optional[List[float]] = None,
-    dirichlet_alpha: Optional[float] = None,
+    train_fraction: float = 0.90,
+    seed: int = 42,
 ) -> DataLoader:
-    """Return the training partition for a specific client."""
-    tf = transforms.Compose([
-        transforms.ToTensor(),
-        transforms.Normalize((0.1307,), (0.3081,))
-    ])
-    dataset = datasets.MNIST("./data", train=True, download=True, transform=tf)
+    """
+    Deterministic IID partition:
+      - Take `train_fraction` of the MNIST train split for training (default 90%).
+      - Evenly slice that region into `num_clients` contiguous shards and return client `client_id` shard.
+    """
+    assert 0 <= client_id < num_clients, "client_id out of range"
+    full = datasets.MNIST(root="./data", train=True, download=True, transform=_mnist_transform())
 
-    # IID partition
-    if not non_iid:
-        partition_size = len(dataset) // num_clients
-        start = cid * partition_size
-        end = start + partition_size
-        partition = torch.utils.data.Subset(dataset, list(range(start, end)))
-        return DataLoader(partition, batch_size=batch_size, shuffle=True)
+    # Use only the first `train_fraction` of the dataset as the training pool
+    train_size = int(len(full) * train_fraction)
+    train_indices = np.arange(train_size)
 
-    # Simple Non-IID (label restriction)
-    if non_iid and dirichlet_alpha is None:
-        labels = np.array(dataset.targets)
-        chosen_labels = list(range((cid * labels_per_client) % 10,
-                                   (cid * labels_per_client) % 10 + labels_per_client))
-        mask = np.isin(labels, chosen_labels)
-        idxs = np.where(mask)[0]
-        partition = torch.utils.data.Subset(dataset, idxs)
-        return DataLoader(partition, batch_size=batch_size, shuffle=True)
+    # Deterministic split into equal shards
+    shard_size = train_size // num_clients
+    start = client_id * shard_size
+    end = train_size if client_id == num_clients - 1 else (start + shard_size)
+    indices = train_indices[start:end]
 
-    # Dirichlet-based partitioning (heterogeneous splits)
-    if non_iid and dirichlet_alpha is not None:
-        labels = np.array(dataset.targets)
-        num_classes = 10
-        idx_by_class = [np.where(labels == i)[0] for i in range(num_classes)]
-        sizes = np.random.dirichlet([dirichlet_alpha] * num_clients, num_classes)
-        client_indices = [[] for _ in range(num_clients)]
-        for c in range(num_classes):
-            idxs = idx_by_class[c]
-            np.random.shuffle(idxs)
-            splits = (sizes[c] * len(idxs)).astype(int)
-            start = 0
-            for client_id in range(num_clients):
-                end = start + splits[client_id]
-                client_indices[client_id].extend(idxs[start:end])
-                start = end
-        partition = torch.utils.data.Subset(dataset, client_indices[cid])
-        return DataLoader(partition, batch_size=batch_size, shuffle=True)
-
-    raise ValueError("Invalid partitioning setup.")
+    subset = Subset(full, indices.tolist())
+    return DataLoader(subset, batch_size=batch_size, shuffle=True, num_workers=2)
 
 
-# --------------------------
-# Training helpers
-# --------------------------
+# ------------------ Training / Eval ------------------
 
-def train_one_epoch(model, trainloader, criterion, optimizer) -> float:
-    """Run one epoch of training and return average loss."""
+def train_one_epoch(
+    model: torch.nn.Module,
+    loader: DataLoader,
+    criterion: torch.nn.Module,
+    optimizer: torch.optim.Optimizer,
+) -> Tuple[float, float]:
+    """Train for one epoch; returns (avg_loss, avg_accuracy)."""
     model.train()
-    total_loss = 0.0
-    for x, y in trainloader:
+    total, correct, total_loss = 0, 0, 0.0
+    for x, y in loader:
         x, y = x.to(DEVICE), y.to(DEVICE)
+
         optimizer.zero_grad()
         logits = model(x)
-        loss = criterion(logits, y)   # ✅ fixed bug here
+        loss = criterion(logits, y)
         loss.backward()
         optimizer.step()
-        total_loss += loss.item()
-    return total_loss / len(trainloader)
+
+        total_loss += float(loss.detach().cpu().item()) * x.size(0)
+        pred = torch.argmax(logits, dim=1)
+        correct += int((pred == y).sum().item())
+        total += int(x.size(0))
+
+    avg_loss = total_loss / max(1, total)
+    avg_acc = correct / max(1, total)
+    return avg_loss, avg_acc
 
 
-def accuracy(model, loader) -> float:
-    """Compute accuracy of a model on a given dataset loader."""
+def accuracy(model: torch.nn.Module, loader: DataLoader) -> float:
+    """Compute accuracy on a DataLoader."""
     model.eval()
     correct, total = 0, 0
     with torch.no_grad():
         for x, y in loader:
             x, y = x.to(DEVICE), y.to(DEVICE)
             logits = model(x)
-            preds = logits.argmax(dim=1)
-            correct += (preds == y).sum().item()
-            total += y.size(0)
-    return correct / total if total > 0 else 0.0
+            pred = torch.argmax(logits, dim=1)
+            correct += int((pred == y).sum().item())
+            total += int(x.size(0))
+    return correct / max(1, total)
 
 
-# --------------------------
-# Param <-> numpy conversions
-# --------------------------
+# ------------------ Param conversion ------------------
 
 def params_to_numpy(model: torch.nn.Module) -> List[np.ndarray]:
-    """Convert model parameters to list of numpy arrays."""
-    return [p.detach().cpu().numpy().copy() for p in model.parameters()]
+    """Extract parameters (same order every time) as float32 numpy arrays."""
+    arrays: List[np.ndarray] = []
+    for p in model.parameters():
+        arrays.append(p.detach().cpu().numpy().astype(np.float32, copy=True))
+    return arrays
+
 
 def numpy_to_params(model: torch.nn.Module, params: List[np.ndarray]) -> None:
-    """Load numpy arrays back into model parameters."""
-    for p, np_arr in zip(model.parameters(), params):
-        p.data = torch.tensor(np_arr, dtype=p.data.dtype, device=p.data.device)
+    """Load numpy arrays into model parameters (order must match)."""
+    with torch.no_grad():
+        for p, arr in zip(model.parameters(), params):
+            tensor = torch.from_numpy(arr).to(p.device, dtype=p.dtype)
+            p.copy_(tensor)
