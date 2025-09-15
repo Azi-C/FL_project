@@ -2,197 +2,243 @@
 pragma solidity ^0.8.20;
 
 /**
- * FLCoordinatorV2
- *
- * What this contract does (lightweight, gas-aware):
- * - Client registration with dataset size |D_i| and participant registry
- * - One-time normalization to initialize r_i^(0) ∝ |D_i| / sum|D|
- * - Store baseline/validation hashes for auditability (blobs stay in FLStorage)
- * - Accept off-chain evaluation results and update on-chain reputation:
- *     r_i(t+1) = r_i(t) + (α * a_i) * (β * s_i_part)   (fixed-point math)
- *   where a_i in [0,1] scaled by 1e6, s_i_part ∈ {+1,-1}
- * - Mark round convergence on-chain (for transparency)
- *
- * Notes:
- * - Heavy work (training/eval) remains off-chain; only the results are recorded here.
- * - This keeps gas low and still matches your protocol’s state machine.
- * - Rewards: we expose a hook to record per-round rewards off-chain; you can extend
- *   to a full ERC20 later (here we only log “virtual rewards”).
+ * Federated-learning coordinator (V2)
+ * - Step 1: registration: clients call registerClient(|D_i|)
+ * - Owner calls closeRegistrationAndInit(): computes initial rep r_i^(0) = |D_i| / sum_j |D_j|
+ * - Optional: setBaselineHash / setValidationHash (pointers/hashes only)
+ * - Per round:
+ *    * beginRound(r) (anyone can open the round once)
+ *    * off-chain: peers train/aggregate; on-chain: submitEval(r, who, a_i_fp, s_i_part)
+ *      ri <- ri + α*ai*β*s  (all fixed-point with FP=1e6, clamp to [0, FP])
+ *    * v1-style proposals/finalize still available for simple consensus anchoring
+ *    * markConverged(r, hash)
+ * - Optional: distributeRewards(k) (owner): credits rewardBalances based on r_i / Σr_j
  */
 contract FLCoordinatorV2 {
-    // ---------- Fixed-point scale (1.0 == 1_000_000) ----------
-    uint256 public constant FP = 1_000_000;
-
-    // ---------- Configurable weights ----------
-    // α + β should = 1.0 (i.e., alpha + beta == FP)
-    uint256 public alpha;  // e.g., 700_000  (0.7)
-    uint256 public beta;   // e.g., 300_000  (0.3)
+    // ------- fixed point scale -------
+    uint256 public constant FP = 1_000_000; // 1.000000
 
     address public owner;
-    bool    public registrationOpen = true;
-    bool    public initialized      = false;
 
-    // Baseline and validation "references" (hashes/checksums/metadata)
-    bytes32 public baselineHash;  // hash of baseline params blob in FLStorage
-    bytes32 public valsetHash;    // hash/seed/metadata of shared validation dataset
+    // registration / participants
+    bool public registrationOpen = true;
+    bool public initialized = false;
 
-    // Participants
-    address[] public participants;
+    address[] private participants;
+    mapping(address => bool) public isParticipant;
+    mapping(address => uint256) public dataSize;    // |D_i|
+    mapping(address => uint256) public rep;         // reputation in FP
+    uint256 public totalData;                       // Σ|D_i|
+    uint256 public totalRep;                        // Σrep_i  (in FP)
 
-    struct ClientInfo {
-        bool    registered;
-        uint64  dataSize;     // |D_i|
-        uint256 rep;          // reputation in fixed-point (scaled by FP)
+    // alpha/beta weights (must sum to FP on init)
+    uint256 public alpha_fp;  // e.g. 600000
+    uint256 public beta_fp;   // e.g. 400000
+
+    // rewards (simple on-chain ledger; not ERC20)
+    uint256 public tokenPool;                 // optional global pool to draw from
+    mapping(address => uint256) public rewardBalance; // credits accrued
+
+    // baseline / validation anchors (hashes only)
+    bytes32 public baselineHash;
+    bytes32 public validationHash;
+
+    // round/meta (simple)
+    struct Round {
+        bool begun;
+        bool finalized;
+        bytes32 consensusHash;  // from V1-style finalize or external agreement
+        bool converged;
+        bytes32 convergedHash;
     }
+    mapping(uint256 => Round) public rounds;
 
-    mapping(address => ClientInfo) public clients;
+    // --- V1-like proposal events (for off-chain listeners) ---
+    event Proposal(uint256 indexed roundId, uint256 aggId, bytes32 hash);
+    event Finalized(uint256 indexed roundId, bytes32 consensusHash);
 
-    uint256 public totalData;     // sum |D_i|
-    uint256 public totalRep;      // sum r_i (scaled by FP) — recomputed at init, updated on changes
-
-    // Round status (complementary to your existing FLCoordinator)
-    struct RoundMeta {
-        bool converged;       // set when |A(w_t+1,V) - A(w_t,V)| < ε
-        bytes32 notes;        // optional metadata (e.g., hash of winner’s params, or blank)
-    }
-    mapping(uint256 => RoundMeta) public rounds;
-
-    // ---------- Events ----------
-    event Registered(address indexed who, uint64 dataSize);
-    event InitReputation(address indexed who, uint256 repFp);
-    event RegistrationClosed(uint256 totalData, uint256 totalRep);
-    event BaselineSet(bytes32 baselineHash);
-    event ValSetHash(bytes32 valHash);
-    event ReputationUpdated(address indexed who, uint256 oldRep, uint256 newRep, int256 deltaSigned);
-    event EvalSubmitted(uint256 indexed roundId, address indexed who, uint256 a_i_fp, int8 s_i_part);
-    event RewardRecorded(uint256 indexed roundId, address indexed who, uint256 amountFp);
-    event Converged(uint256 indexed roundId);
+    // --- V2 events ---
+    event Registered(address indexed who, uint256 dataSize);
+    event Initialized(uint256 participants, uint256 totalData, uint256 totalRep);
+    event RoundBegan(uint256 indexed roundId);
+    event EvalSubmitted(uint256 indexed roundId, address indexed who, uint256 a_i_fp, int8 s_i_part, uint256 newRep);
+    event Converged(uint256 indexed roundId, bytes32 hash);
+    event RewardsDistributed(uint256 k, uint256 totalRep);
 
     modifier onlyOwner() {
         require(msg.sender == owner, "Only owner");
         _;
     }
 
-    constructor(uint256 alphaFp, uint256 betaFp) {
-        require(alphaFp + betaFp == FP, "alpha+beta!=1.0");
-        alpha = alphaFp;
-        beta = betaFp;
+    constructor(uint256 _alpha_fp, uint256 _beta_fp) {
+        require(_alpha_fp + _beta_fp == FP, "alpha+beta != 1.0");
         owner = msg.sender;
+        alpha_fp = _alpha_fp;
+        beta_fp = _beta_fp;
     }
 
-    // ---------- Admin / setup ----------
-
-    function setBaselineHash(bytes32 h) external onlyOwner {
-        baselineHash = h;
-        emit BaselineSet(h);
-    }
-
-    function setValidationHash(bytes32 h) external onlyOwner {
-        valsetHash = h;
-        emit ValSetHash(h);
-    }
-
-    // Client self-registration (while open)
-    function registerClient(uint64 dataSize) external {
+    // --------- Step 1: Registration ----------
+    function registerClient(uint256 _dataSize) external {
         require(registrationOpen, "Registration closed");
-        require(!clients[msg.sender].registered, "Already registered");
-        require(dataSize > 0, "dataSize=0");
+        require(!isParticipant[msg.sender], "Already registered");
+        require(_dataSize > 0, "dataSize=0");
 
-        clients[msg.sender] = ClientInfo({
-            registered: true,
-            dataSize: dataSize,
-            rep: 0
-        });
+        isParticipant[msg.sender] = true;
         participants.push(msg.sender);
-        totalData += dataSize;
+        dataSize[msg.sender] = _dataSize;
+        totalData += _dataSize;
 
-        emit Registered(msg.sender, dataSize);
+        emit Registered(msg.sender, _dataSize);
     }
 
-    // One-time initialization: set r_i^(0) ∝ |D_i|/sum|D|
-    // We pick repFp = round( FP * dataSize / totalData ), and also set totalRep.
     function closeRegistrationAndInit() external onlyOwner {
         require(registrationOpen, "Already closed");
+        require(!initialized, "Already initialized");
+        require(participants.length > 0, "No participants");
+        require(totalData > 0, "totalData=0");
+
         registrationOpen = false;
 
-        require(!initialized, "Already initialized");
-        require(totalData > 0, "No data");
-
-        uint256 _totalRep = 0;
+        // r_i^(0) = |D_i| / Σ|D|
+        // Ensure Σrep_i = FP
+        uint256 sumRep = 0;
         for (uint256 i = 0; i < participants.length; i++) {
-            address p = participants[i];
-            ClientInfo storage ci = clients[p];
-            uint256 repFp = (uint256(ci.dataSize) * FP) / totalData;
-            ci.rep = repFp;
-            _totalRep += repFp;
-            emit InitReputation(p, repFp);
+            address a = participants[i];
+            uint256 r = (dataSize[a] * FP) / totalData;
+            rep[a] = r;
+            sumRep += r;
         }
-        totalRep = _totalRep;
+        // Fix rounding (assign remainder to first)
+        if (sumRep != FP) {
+            uint256 diff;
+            if (sumRep < FP) {
+                diff = FP - sumRep;
+                rep[participants[0]] += diff;
+                sumRep = FP;
+            } else {
+                diff = sumRep - FP;
+                if (rep[participants[0]] > diff) {
+                    rep[participants[0]] -= diff;
+                    sumRep = FP;
+                }
+            }
+        }
+        totalRep = sumRep;
         initialized = true;
-
-        emit RegistrationClosed(totalData, totalRep);
+        emit Initialized(participants.length, totalData, totalRep);
     }
 
-    // ---------- Views ----------
+    // --------- Anchors for baseline/validation ----------
+    function setBaselineHash(bytes32 h) external onlyOwner { baselineHash = h; }
+    function setValidationHash(bytes32 h) external onlyOwner { validationHash = h; }
 
+    // --------- Rounds ----------
+    function beginRound(uint256 roundId) external {
+        Round storage r = rounds[roundId];
+        require(!r.finalized, "Already finalized");
+        r.begun = true;
+        emit RoundBegan(roundId);
+    }
+
+    // V1-like proposal/finalize (hash anchoring only)
+    function submitProposal(uint256 roundId, uint256 aggId, bytes32 h) external {
+        Round storage r = rounds[roundId];
+        require(!r.finalized, "Already finalized");
+        require(r.begun, "NotBegun()");
+        emit Proposal(roundId, aggId, h);
+    }
+
+    function finalize(uint256 roundId, uint256 /*totalSelected*/) external {
+        Round storage r = rounds[roundId];
+        require(!r.finalized, "Already finalized");
+        require(r.begun, "NotBegun()");
+        r.finalized = true;
+        // In a real impl, you’d pass the decided hash; we keep a placeholder.
+        r.consensusHash = bytes32(0);
+        emit Finalized(roundId, r.consensusHash);
+    }
+
+    // --------- Per-client eval update (your formula) ----------
+    // ri(t+1) = ri(t) + α*ai * β*s_part
+    // where ai, α, β are in FP, s_part in {-1, +1}
+    function submitEval(uint256 roundId, address who, uint256 a_i_fp, int8 s_i_part) external {
+        require(initialized, "Not initialized");
+        Round storage r = rounds[roundId];
+        require(r.begun, "NotBegun()");
+        require(isParticipant[who], "Not participant");
+        require(a_i_fp <= FP, "ai>1.0");
+        require(s_i_part == -1 || s_i_part == 1, "s in {-1,1}");
+
+        uint256 oldRep = rep[who];
+
+        // delta = α * ai
+        uint256 delta = (alpha_fp * a_i_fp) / FP;
+        // delta2 = delta * β
+        uint256 delta2 = (delta * beta_fp) / FP;
+
+        uint256 newRep;
+        if (s_i_part == 1) {
+            // add
+            newRep = oldRep + delta2;
+            if (newRep > FP) newRep = FP;
+        } else {
+            // subtract
+            if (oldRep > delta2) {
+                newRep = oldRep - delta2;
+            } else {
+                newRep = 0;
+            }
+        }
+
+        rep[who] = newRep;
+
+        // keep totalRep = Σrep_i (adjust by difference, clamp)
+        if (newRep >= oldRep) {
+            totalRep += (newRep - oldRep);
+            if (totalRep > FP * participants.length) {
+                totalRep = FP * participants.length;
+            }
+        } else {
+            totalRep -= (oldRep - newRep);
+        }
+
+        emit EvalSubmitted(roundId, who, a_i_fp, s_i_part, newRep);
+    }
+
+    // Optional: distribute reward k proportionally to reputation
+    function distributeRewards(uint256 k) external onlyOwner {
+        require(initialized, "Not initialized");
+        require(totalRep > 0, "totalRep=0");
+        for (uint256 i = 0; i < participants.length; i++) {
+            address a = participants[i];
+            // p_i = k * rep_i / Σrep
+            uint256 p = (k * rep[a]) / totalRep;
+            rewardBalance[a] += p;
+        }
+        if (tokenPool >= k) tokenPool -= k;
+        emit RewardsDistributed(k, totalRep);
+    }
+
+    // Convergence marker (hash anchoring)
+    function markConverged(uint256 roundId, bytes32 h) external {
+        Round storage r = rounds[roundId];
+        require(r.begun, "NotBegun()");
+        r.converged = true;
+        r.convergedHash = h;
+        emit Converged(roundId, h);
+    }
+
+    // ------ views / helpers ------
     function getParticipants() external view returns (address[] memory) {
         return participants;
     }
 
-    function getClient(address who) external view returns (bool registered, uint64 dataSize, uint256 repFp) {
-        ClientInfo storage ci = clients[who];
-        return (ci.registered, ci.dataSize, ci.rep);
+    function getClient(address a) external view returns (uint256 dsize, uint256 r_fp) {
+        return (dataSize[a], rep[a]);
     }
 
-    // ---------- Eval / reputation / rewards ----------
-
-    // Submit off-chain eval result for a given round:
-    // a_i_fp is accuracy [0..FP], s_i_part = +1 (valid) or -1 (invalid)
-    // Updates reputation: r_new = r_old + (alpha * a_i_fp) * (beta * s_i_part) / (FP*FP)  (with fixed-point)
-    function submitEval(uint256 roundId, address who, uint256 a_i_fp, int8 s_i_part) external {
-        require(initialized, "Not initialized");
-        require(clients[who].registered, "Not registered");
-        require(s_i_part == 1 || s_i_part == -1, "spart must be +/-1");
-        require(a_i_fp <= FP, "a_i out of range");
-
-        emit EvalSubmitted(roundId, who, a_i_fp, s_i_part);
-
-        ClientInfo storage ci = clients[who];
-        uint256 rOld = ci.rep;
-
-        // delta = (alpha * a_i_fp / FP) * (beta * s / FP) in fixed-point
-        // Combine as (alpha * a_i_fp * beta) / FP^2, then apply sign.
-        uint256 mag = (alpha * a_i_fp) / FP;           // α * a_i
-        mag = (mag * beta) / FP;                       // α * a_i * β
-        int256 deltaSigned = s_i_part == 1 ? int256(mag) : -int256(mag);
-
-        // apply
-        int256 rNewSigned = int256(rOld) + deltaSigned;
-        if (rNewSigned < 0) rNewSigned = 0;
-        uint256 rNew = uint256(rNewSigned);
-
-        // update totals
-        if (rNew >= rOld) {
-            totalRep += (rNew - rOld);
-        } else {
-            totalRep -= (rOld - rNew);
-        }
-        ci.rep = rNew;
-
-        emit ReputationUpdated(who, rOld, rNew, deltaSigned);
-    }
-
-    // Record "virtual" reward (scaled FP). Off-chain decides the amount per round,
-    // typically: p_i = K_round * r_i / sum_j r_j. This function only emits/logs it.
-    function recordReward(uint256 roundId, address who, uint256 amountFp) external {
-        require(clients[who].registered, "Not registered");
-        emit RewardRecorded(roundId, who, amountFp);
-    }
-
-    // Mark round as converged (for auditability)
-    function markConverged(uint256 roundId, bytes32 notes) external {
-        rounds[roundId].converged = true;
-        rounds[roundId].notes = notes; // e.g., hash of winner global (optional)
-        emit Converged(roundId);
+    function getRound(uint256 roundId) external view returns (bool begun, bool finalized, bytes32 hash) {
+        Round storage rr = rounds[roundId];
+        return (rr.begun, rr.finalized, rr.consensusHash);
     }
 }

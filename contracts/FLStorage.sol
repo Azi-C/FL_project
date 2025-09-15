@@ -1,26 +1,18 @@
 // SPDX-License-Identifier: MIT
 pragma solidity ^0.8.20;
 
-// Minimal storage used in your last working flow: just put/get chunk.
-// No owner checks, no "begin round" gate.
 contract FLStorage {
-    // roundId => writerId => chunkIdx => data
-    mapping(uint256 => mapping(uint256 => mapping(uint256 => bytes))) private chunks;
+    struct Chunk { bytes data; }
+    mapping(uint256 => mapping(uint256 => mapping(uint256 => Chunk))) public blobs;
 
-    function putChunk(
-        uint256 roundId,
-        uint256 writerId,
-        uint256 idx,
-        bytes calldata data
-    ) external {
-        chunks[roundId][writerId][idx] = data;
+    event ChunkStored(uint256 indexed roundId, uint256 indexed writerId, uint256 idx, bytes data);
+
+    function putChunk(uint256 roundId, uint256 writerId, uint256 idx, bytes calldata data) external {
+        blobs[roundId][writerId][idx] = Chunk({data: data});
+        emit ChunkStored(roundId, writerId, idx, data);
     }
 
-    function getChunk(
-        uint256 roundId,
-        uint256 writerId,
-        uint256 idx
-    ) external view returns (bytes memory) {
-        return chunks[roundId][writerId][idx];
+    function getChunk(uint256 roundId, uint256 writerId, uint256 idx) external view returns (bytes memory) {
+        return blobs[roundId][writerId][idx].data;
     }
 }
