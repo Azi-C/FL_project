@@ -36,17 +36,32 @@ def normalize_hex(hs) -> str:
             hs = hs[2:]
     return hs.lower()
 
-def select_aggregators_uniform(reputation: Dict[int, float], gamma: float,
-                               aggregators: List[Aggregator], k: int,
-                               rng: np.random.Generator) -> List[Aggregator]:
-    """Select k aggregators uniformly from those above gamma (or fallback to all)."""
-    if not aggregators:
+def select_aggregators_by_reputation(
+    reputation: Dict[int, float],
+    gamma: float,
+    aggregators: List[Aggregator],
+    k: int,
+    rng: np.random.Generator
+) -> List[Aggregator]:
+    """
+    Select aggregators with reputation >= gamma.
+    - If eligible <= k: return all eligible.
+    - If eligible > k: return top-k by reputation (ties broken randomly).
+    """
+    if not aggregators or k <= 0:
         return []
-    eligible = [a for a in aggregators if reputation.get(a.cid, 0.0) >= gamma]
-    pool = eligible if len(eligible) > 0 else aggregators
-    k = max(1, min(k, len(pool)))
-    idxs = rng.choice(len(pool), size=k, replace=False)
-    return [pool[int(i)] for i in idxs]
+
+    # Build [(agg, rep)] for those meeting the gamma threshold
+    elig = [(a, float(reputation.get(a.cid, 0.0))) for a in aggregators if reputation.get(a.cid, 0.0) >= gamma]
+
+    if len(elig) <= k:
+        return [a for (a, _) in elig]
+
+    # Shuffle to break ties, then sort by rep desc
+    rng.shuffle(elig)
+    elig.sort(key=lambda t: t[1], reverse=True)
+    chosen = elig[:k]
+    return [a for (a, _) in chosen]
 
 def first_free_round(chain: FLChain, start: int = 1, max_scan: int = 100000) -> int:
     """Find the first round id not yet finalized on chain."""
@@ -119,8 +134,8 @@ def run_rounds(
     # Initial reputation ∝ data size
     sizes = [c.num_examples() for c in clients]
     total_k = float(sum(sizes)) or 1.0
-    reputation: Dict[int, float] = {c.cid: (sizes[i] / total_k) for i, c in enumerate(clients)}
-    print("Client sizes:", {c.cid: sizes[i] for c in enumerate(clients)})
+    reputation: Dict[int, float] = {c.cid: (sizes[idx] / total_k) for idx, c in enumerate(clients)}
+    print("Client sizes:", {c.cid: sizes[idx] for idx, c in enumerate(clients)})
     print("Init reputations:", {cid: round(reputation[cid], 4) for cid in sorted(reputation)})
 
     # On-chain setup
@@ -185,7 +200,8 @@ def run_rounds(
                                 template=global_params, chunk_size=global_chunk_size)
 
         # --- Local training ---
-        for c in clients: c.train_local()
+        for c in clients: 
+            c.train_local()
 
         # Collect updates
         client_params = {int(c.cid): c.get_params() for c in clients}
@@ -208,7 +224,8 @@ def run_rounds(
                 tmp = create_model().to(DEVICE)
                 numpy_to_params(tmp, client_params[int(c.cid)])
                 acc_i = accuracy(tmp, valloader)
-                if acc_i > best_acc: best_acc, best_id = acc_i, int(c.cid)
+                if acc_i > best_acc: 
+                    best_acc, best_id = acc_i, int(c.cid)
             valid_ids.append(best_id)
             failed_ids = [cid for cid in failed_ids if cid != best_id]
         print(f"[Validation τ={tau}] passed={sorted(valid_ids)} failed={sorted(failed_ids)}")
@@ -216,9 +233,16 @@ def run_rounds(
         # Aggregator eligibility + selection
         eligible = [a.cid for a in aggregs if reputation.get(a.cid,0.0) >= current_gamma]
         print(f"[Gamma] eligible={eligible}")
-        chosen = select_aggregators_uniform(reputation, current_gamma, aggregs, k_aggregators, rng)
+
+        chosen = select_aggregators_by_reputation(
+            reputation=reputation,
+            gamma=current_gamma,
+            aggregators=aggregs,
+            k=k_aggregators,
+            rng=rng
+        )
         chosen_ids = [a.cid for a in chosen]
-        print(f"Chosen aggregators: {chosen_ids}")
+        print(f"Chosen aggregators (k={k_aggregators}): {chosen_ids}")
 
         # Proposals
         proposals = []
@@ -230,25 +254,47 @@ def run_rounds(
             proposals.append({"agg_id": agg.cid, "params": agg_params, "hash": h, "val_acc": prop_val_acc})
             print(f" • Agg {agg.cid}: hash={h[:12]} V-acc={prop_val_acc:.4f}")
 
-        # On-chain finalize
+        # On-chain finalize (simplified for brevity)
         for p in proposals:
-            chain.submit_proposal(round_id=round_id, agg_id=int(p["agg_id"]), hash_hex="0x"+p["hash"])
-        chain.finalize(round_id=round_id, total_selected=len(proposals))
+            chain.submit_proposal(round_id=round_id, agg_id=int(p["agg_id"]), hash_hex="0x" + p["hash"])
+        try:
+            chain.finalize(round_id=round_id, total_selected=len(proposals))
+        except Exception as e:
+            print(f"[WARN] finalize failed or not supported: {e}")
 
         finalized, consensus_hex = chain.get_round(round_id)
-        consensus_hex_norm = normalize_hex(consensus_hex)
-        hash_votes: Dict[str,int] = {p["hash"]: int(chain.get_votes(round_id,"0x"+p["hash"])) for p in proposals}
-        if finalized and consensus_hex_norm != "0"*64:
-            winner = next((p for p in proposals if normalize_hex(p["hash"]) == consensus_hex_norm), None)
-            if winner is None:
-                winner = max(proposals, key=lambda q:q["val_acc"])
-                print("Consensus hash not found → fallback to best V-acc")
-        else:
-            winner = max(proposals, key=lambda p:p["val_acc"])
-            print("Consensus FAILED → fallback to best V-acc")
-        aggregated = winner["params"]; winner_agg_id = int(winner["agg_id"])
+        consensus_hex_norm = (consensus_hex or "").lower().lstrip("0x")
+        hash_votes = {}
+        for p in proposals:
+            try:
+                hash_votes[p["hash"]] = int(chain.get_votes(round_id, "0x" + p["hash"]))
+            except Exception:
+                hash_votes[p["hash"]] = 0
 
-        # Upload updates + winner
+        # Winner
+        winner = None
+        if finalized and consensus_hex_norm and set(consensus_hex_norm) != {"0"}:
+            for p in proposals:
+                if p["hash"].lower() == consensus_hex_norm:
+                    winner = p
+                    print(f"[Consensus] On-chain winner: agg={winner['agg_id']} hash={winner['hash'][:12]}..")
+                    break
+
+        unique_hashes = {p["hash"] for p in proposals}
+        all_equal_locally = (len(unique_hashes) == 1)
+        if winner is None and all_equal_locally:
+            only_hash = next(iter(unique_hashes))
+            winner = next(p for p in proposals if p["hash"] == only_hash)
+            print(f"[Consensus] Local unanimous agreement: hash={only_hash[:12]}.. (accepting)")
+
+        if winner is None:
+            winner = max(proposals, key=lambda p: p["val_acc"])
+            print("[Consensus] FAILED → fallback to best V-acc")
+
+        aggregated = winner["params"]
+        winner_agg_id = int(winner["agg_id"])
+
+        # Upload updates
         for cid, params in client_params.items():
             blob = pack_params_float32(params)
             store.upload_blob(round_id, cid, blob, chunk_size=client_chunk_size)
@@ -275,7 +321,6 @@ def run_rounds(
         converged = (delta < epsilon)
         print(f"Δ={delta:.6f}, new V-acc={new_val_acc:.4f}, converged={converged}")
 
-        # Advance pointer for next round
         current_global_round_id = round_id
         current_global_writer_ns = global_ns_id
         prev_val_acc = new_val_acc
@@ -309,10 +354,19 @@ def run_rounds(
         save_json("artifacts/reputation.json", {str(cid):float(r) for cid,r in reputation.items()})
         save_model_state_dict(f"artifacts/checkpoints/round_{rnd:03d}.pt", global_model.state_dict())
 
-        if converged: break
+        if converged: 
+            break
 
     torch.save(global_model.state_dict(),"global_mnist_cnn.pt")
     print("Done.")
 
 if __name__ == "__main__":
-    run_rounds()
+    run_rounds(
+        num_clients=6, num_aggregators=3, k_aggregators=2,
+        max_rounds=10, local_epochs=1, lr=0.01,
+        tau=1.0, gamma=0.20, non_iid=False,
+        proportions=[0.35, 0.25, 0.18, 0.12, 0.06, 0.04],
+        dirichlet_alpha=None,
+        reset_reputation=True,
+        alpha=0.6, beta=0.4, epsilon=1e-3
+    )

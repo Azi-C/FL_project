@@ -1,3 +1,4 @@
+# src/storage_chain.py
 from __future__ import annotations
 import json, time, threading
 from dataclasses import dataclass
@@ -47,6 +48,15 @@ class FLStorageChain:
         self.sender = self.account.address
         self.chain_id = self.w3.eth.chain_id
 
+    # -------- gas helpers (EIP-1559 strict) --------
+    def _estimate_gas_eip1559(self, fn, *args) -> int:
+        call = {"from": self.sender}
+        tx_for_est = fn(*args).build_transaction(call)
+        est = self.w3.eth.estimate_gas(tx_for_est)
+        gas_limit_block = self.w3.eth.get_block("latest").get("gasLimit", 30_000_000)
+        gas = min(int(est * 1.2) + 10_000, int(gas_limit_block * 0.9))
+        return max(gas, 50_000)
+
     def _wait_receipt(self, tx_hash, timeout=60.0, poll=0.2):
         start = time.time()
         while True:
@@ -57,21 +67,31 @@ class FLStorageChain:
                     raise TimeoutError("Timed out waiting for transaction receipt")
                 time.sleep(poll)
 
-    def _send_tx(self, fn, *args, gas: Optional[int] = None, value: int = 0, retries: int = 3):
+    def _send_tx(self, fn, *args, value: int = 0, retries: int = 3):
+        """Strict EIP-1559 (type=2) tx with estimated gas and fee caps."""
         for _ in range(retries):
             with _TX_LOCK:
                 nonce = self.w3.eth.get_transaction_count(self.sender, "pending")
-                base = int(self.w3.eth.gas_price)
-                tip  = max(1, int(base * 0.1))
-                tx = fn(*args).build_transaction({
+                gas = self._estimate_gas_eip1559(fn, *args)
+
+                base_fee = self.w3.eth.get_block("latest")["baseFeePerGas"]
+                try:
+                    tip = self.w3.eth.max_priority_fee
+                except Exception:
+                    tip = self.w3.to_wei(1, "gwei")
+
+                tx_args = {
                     "from": self.sender,
                     "nonce": nonce,
                     "chainId": self.chain_id,
                     "value": value,
-                    "maxFeePerGas": base + tip,
-                    "maxPriorityFeePerGas": tip,
-                    "gas": gas or 4_000_000,
-                })
+                    "gas": gas,
+                    "type": 2,
+                    "maxPriorityFeePerGas": int(tip),
+                    "maxFeePerGas": int(base_fee + 2 * tip),
+                }
+
+                tx = fn(*args).build_transaction(tx_args)
                 signed = self.w3.eth.account.sign_transaction(tx, private_key=self.privkey)
                 try:
                     h = self.w3.eth.send_raw_transaction(signed.raw_transaction)
