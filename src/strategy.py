@@ -148,7 +148,7 @@ def run_rounds(
     chain = FLChain(rpc_url=rpc_url, contract_address=coord_addr, privkey=privkey)
     store = FLStorageChain(rpc_url=rpc_url, contract_address=storage_addr, privkey=privkey)
 
-    # Baseline upload (Round 0)
+    # -------- Baseline upload + on-chain assignment (Round 0) --------
     round_base = first_free_round(chain, start=1) - 1
     print(f"On-chain first free round will be: {round_base + 1}")
     print(f"Storing baseline (Round 0) under round_id={round_base}")
@@ -156,15 +156,27 @@ def run_rounds(
     baseline_hash = params_hash(global_params, decimals=6)
     GLOBAL_NS_OFFSET = 1_000_000
     baseline_ns_id = GLOBAL_NS_OFFSET + 0
+
     baseline_blob = pack_params_float32(global_params)
     baseline_chunks, _ = store.upload_blob(round_base, baseline_ns_id, baseline_blob, chunk_size=global_chunk_size)
     print(f"[Baseline] hash={baseline_hash[:12]}..  chunks={baseline_chunks}  ns_id={baseline_ns_id}")
 
-    # Clients + manager pull baseline
+    # Assign baseline on-chain (one-shot, authoritative pointer)
+    chain.assign_baseline(
+        hash_hex=baseline_hash,
+        round_id=round_base,
+        writer_id=baseline_ns_id,
+        num_chunks=baseline_chunks
+    )
+
+    # -------- All parties pull the authoritative baseline from chain --------
+    set_, b_hash_hex, rid, wid, n_chunks = chain.get_baseline()
+    if not set_:
+        raise RuntimeError("Baseline not assigned on-chain")
+    # Pull baseline via FLStorage pointer (rid,wid)
     for c in clients:
-        c.sync_from_storage(store, round_id=round_base, writer_id=baseline_ns_id,
-                            template=global_params, chunk_size=global_chunk_size)
-    blob0 = store.download_blob(round_base, baseline_ns_id, chunk_size=global_chunk_size)
+        c.sync_from_storage(store, round_id=rid, writer_id=wid, template=global_params, chunk_size=global_chunk_size)
+    blob0 = store.download_blob(rid, wid, chunk_size=global_chunk_size)
     downloaded_global_params = unpack_params_float32(blob0, template=global_params)
     numpy_to_params(global_model, downloaded_global_params)
     global_params = downloaded_global_params
@@ -173,8 +185,8 @@ def run_rounds(
     prev_val_acc = accuracy(global_model, valloader)
 
     # Track authoritative source for next pulls
-    current_global_round_id = round_base
-    current_global_writer_ns = baseline_ns_id
+    current_global_round_id = rid
+    current_global_writer_ns = wid
 
     converged, rnd, current_gamma = False, 0, float(gamma)
     while rnd < max_rounds and not converged:
@@ -187,7 +199,7 @@ def run_rounds(
         print(f"Reputations (start): { {cid: round(reputation[cid],4) for cid in sorted(reputation)} }")
         print(f"Prev global V-accuracy: {prev_val_acc:.6f} | ε = {epsilon}")
 
-        # --- All pull current global from chain ---
+        # --- All pull current global from authoritative pointer ---
         mgr_blob = store.download_blob(current_global_round_id, current_global_writer_ns, chunk_size=global_chunk_size)
         mgr_global_params = unpack_params_float32(mgr_blob, template=global_params)
         numpy_to_params(global_model, mgr_global_params)
@@ -198,7 +210,7 @@ def run_rounds(
                                 template=global_params, chunk_size=global_chunk_size)
 
         # --- Local training ---
-        for c in clients: 
+        for c in clients:
             c.train_local()
 
         # Collect updates
@@ -222,7 +234,7 @@ def run_rounds(
                 tmp = create_model().to(DEVICE)
                 numpy_to_params(tmp, client_params[int(c.cid)])
                 acc_i = accuracy(tmp, valloader)
-                if acc_i > best_acc: 
+                if acc_i > best_acc:
                     best_acc, best_id = acc_i, int(c.cid)
             valid_ids.append(best_id)
             failed_ids = [cid for cid in failed_ids if cid != best_id]
@@ -252,7 +264,7 @@ def run_rounds(
             proposals.append({"agg_id": agg.cid, "params": agg_params, "hash": h, "val_acc": prop_val_acc})
             print(f" • Agg {agg.cid}: hash={h[:12]} V-acc={prop_val_acc:.4f}")
 
-        # On-chain finalize (simplified for brevity)
+        # On-chain finalize (V1 stub)
         for p in proposals:
             chain.submit_proposal(round_id=round_id, agg_id=int(p["agg_id"]), hash_hex="0x" + p["hash"])
         try:
@@ -319,6 +331,7 @@ def run_rounds(
         converged = (delta < epsilon)
         print(f"Δ={delta:.6f}, new V-acc={new_val_acc:.4f}, converged={converged}")
 
+        # Advance pointer for next round pulls
         current_global_round_id = round_id
         current_global_writer_ns = global_ns_id
         prev_val_acc = new_val_acc
@@ -352,10 +365,10 @@ def run_rounds(
         save_json("artifacts/reputation.json", {str(cid):float(r) for cid,r in reputation.items()})
         save_model_state_dict(f"artifacts/checkpoints/round_{rnd:03d}.pt", global_model.state_dict())
 
-        if converged: 
+        if converged:
             break
 
-    torch.save(global_model.state_dict(),"global_mnist_cnn.pt")
+    torch.save(global_model.state_dict(), "global_mnist_cnn.pt")
     print("Done.")
 
 if __name__ == "__main__":

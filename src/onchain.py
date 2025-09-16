@@ -33,7 +33,7 @@ class FLChain:
         self.acct = self.w3.eth.account.from_key(privkey)
         self.chain_id = self.w3.eth.chain_id
 
-    # ---------------- internals ----------------
+    # ---------------- internals (EIP-1559 strict) ----------------
 
     def _estimate_gas_eip1559(self, fn, *args) -> int:
         """Estimate gas and cap it below the block gas limit."""
@@ -83,6 +83,30 @@ class FLChain:
                 return True
         return False
 
+    # ---------------- baseline helpers ----------------
+
+    def assign_baseline(self, hash_hex: str, round_id: int, writer_id: int, num_chunks: int) -> str:
+        """
+        assignBaseline(bytes32 hash, uint256 roundId, uint256 writerId, uint256 numChunks)
+        """
+        if hash_hex.startswith(("0x", "0X")):
+            hash_hex = hash_hex[2:]
+        if len(hash_hex) != 64:
+            raise ValueError("baseline hash must be 32 bytes (64 hex chars)")
+        b32 = bytes.fromhex(hash_hex)
+
+        fn = self.contract.functions.assignBaseline
+        tx = self._build_tx(fn, b32, int(round_id), int(writer_id), int(num_chunks))
+        return self._send(tx)
+
+    def get_baseline(self) -> Tuple[bool, str, int, int, int]:
+        """
+        getBaseline() -> (bool set, bytes32 hash, uint256 roundId, uint256 writerId, uint256 numChunks)
+        Return hash as a lower hex string without 0x.
+        """
+        set_, h, rid, wid, n = self.contract.functions.getBaseline().call()
+        return bool(set_), h.hex(), int(rid), int(wid), int(n)
+
     # ---------------- contract calls ----------------
 
     def submit_proposal(self, round_id: int, agg_id: int, hash_hex: str) -> str:
@@ -106,6 +130,7 @@ class FLChain:
     def get_round(self, round_id: int) -> Tuple[bool, str]:
         """
         getRound(uint256) -> (bool finalized, bytes32 consensusHash)
+        Returns (finalized, hex_string_without_0x)
         """
         finalized, h = self.contract.functions.getRound(int(round_id)).call()
         return bool(finalized), h.hex()
@@ -113,6 +138,7 @@ class FLChain:
     def get_votes(self, round_id: int, hash_hex: str) -> int:
         """
         Optional: getVotes(uint256, bytes32) -> uint256
+        If ABI does not expose it (or reverts), return 0.
         """
         try:
             if not self._has_function("getVotes"):
