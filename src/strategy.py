@@ -43,11 +43,7 @@ def select_aggregators_random(
     k: int,
     rng: np.random.Generator
 ) -> List[Aggregator]:
-    """
-    Uniform random selection among aggregators with reputation >= gamma.
-    - If eligible <= k: return all eligible.
-    - If eligible > k: sample k without replacement uniformly at random.
-    """
+    """Randomly select k aggregators from those above gamma."""
     if not aggregators or k <= 0:
         return []
 
@@ -188,8 +184,17 @@ def run_rounds(
     set_, b_hash_hex, rid, wid, n_chunks = chain.get_baseline()
     if not set_:
         raise RuntimeError("Baseline not assigned on-chain")
+
     for c in clients:
-        c.sync_from_storage(store, round_id=rid, writer_id=wid, template=global_params, chunk_size=global_chunk_size)
+        c.fetch_baseline_from_chain(
+            chain=chain,
+            store=store,
+            template=global_params,
+            chunk_size=global_chunk_size,
+            verify_hash=True
+        )
+
+    # Manager also reconstructs baseline to sync global model
     blob0 = store.download_blob(rid, wid, chunk_size=global_chunk_size)
     downloaded_global_params = unpack_params_float32(blob0, template=global_params)
     numpy_to_params(global_model, downloaded_global_params)
@@ -385,7 +390,7 @@ def run_rounds(
 
 if __name__ == "__main__":
     run_rounds(
-        num_clients=6, num_aggregators=6, k_aggregators=2,
+        num_clients=6, num_aggregators=3, k_aggregators=2,
         max_rounds=10, local_epochs=1, lr=0.01,
         tau=1.0, gamma=0.20, non_iid=False,
         proportions=[0.35, 0.25, 0.18, 0.12, 0.06, 0.04],
@@ -393,3 +398,4 @@ if __name__ == "__main__":
         reset_reputation=True,
         alpha=0.6, beta=0.4, epsilon=1e-3
     )
+

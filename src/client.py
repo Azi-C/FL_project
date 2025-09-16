@@ -2,10 +2,22 @@ from __future__ import annotations
 from typing import List, Optional, Sequence
 import torch
 import numpy as np
+import hashlib
 
 from model import create_model
 from utils import DEVICE, train_one_epoch, params_to_numpy, numpy_to_params, load_partition_for_client
 from storage_chain import FLStorageChain, unpack_params_float32
+
+
+def _hash_params_rounded(params: List[np.ndarray], decimals: int = 6) -> str:
+    """Replicates strategy.params_hash: float32, round, then SHA-256 over bytes."""
+    h = hashlib.sha256()
+    for a in params:
+        arr = np.asarray(a, dtype=np.float32)
+        if decimals is not None:
+            arr = np.round(arr, decimals=decimals)
+        h.update(arr.tobytes(order="C"))
+    return h.hexdigest()
 
 
 class Client:
@@ -58,11 +70,44 @@ class Client:
         chunk_size: int = 4 * 1024,
     ) -> None:
         """
-        Pull the authoritative global params from FLStorage and load them locally.
+        Pull the authoritative params from FLStorage and load them locally.
         """
         blob = store.download_blob(round_id, writer_id, chunk_size=chunk_size)
         params = unpack_params_float32(blob, template)
         self.set_params(params)
+
+    def fetch_baseline_from_chain(
+        self,
+        chain,
+        store: FLStorageChain,
+        template: List[np.ndarray],
+        chunk_size: int = 4 * 1024,
+        verify_hash: bool = True,
+    ) -> None:
+        """
+        Fetch the baseline model from the coordinator + storage.
+        - Reads the baseline pointer from FLCoordinator.
+        - Downloads from FLStorage.
+        - Optionally verifies the hash against the on-chain baselineHash
+          using the same rounding-based hashing as strategy.params_hash.
+        """
+        set_, h_hex, rid, wid, _ = chain.get_baseline()
+        if not set_:
+            raise RuntimeError("Baseline not assigned on-chain yet.")
+
+        # Download baseline bytes
+        blob = store.download_blob(rid, wid, chunk_size=chunk_size)
+        # Unpack into params using the provided template (for shapes)
+        params = unpack_params_float32(blob, template)
+        # Load into local model
+        self.set_params(params)
+
+        # Optional integrity check (match strategy’s hashing)
+        if verify_hash:
+            local_hash = _hash_params_rounded(params, decimals=6)
+            # h_hex from contract comes without 0x and already lowercase via .hex()
+            if local_hash != h_hex.lower().lstrip("0x"):
+                raise RuntimeError(f"Baseline hash mismatch for client {self.cid}")
 
     # ---------- Local training ----------
 
