@@ -11,8 +11,8 @@ ART_COORD_PATH = "artifacts/contracts/FLCoordinator.sol/FLCoordinator.json"
 
 class FLChain:
     """
-    Thin wrapper around the FLCoordinator contract.
-    Tolerates missing optional functions (e.g., getVotes) by returning safe defaults.
+    Wrapper around the FLCoordinator contract.
+    Handles baseline assignment, initial reputations, proposals/finalize.
     """
 
     def __init__(self, rpc_url: str, contract_address: str, privkey: str) -> None:
@@ -36,7 +36,6 @@ class FLChain:
     # ---------------- internals (EIP-1559 strict) ----------------
 
     def _estimate_gas_eip1559(self, fn, *args) -> int:
-        """Estimate gas and cap it below the block gas limit."""
         call = {"from": self.acct.address}
         tx_for_est = fn(*args).build_transaction(call)
         est = self.w3.eth.estimate_gas(tx_for_est)
@@ -45,9 +44,6 @@ class FLChain:
         return max(gas, 50_000)
 
     def _build_tx(self, fn, *args) -> dict:
-        """
-        Build a strict EIP-1559 (type=2) transaction.
-        """
         nonce = self.w3.eth.get_transaction_count(self.acct.address, "pending")
         gas = self._estimate_gas_eip1559(fn, *args)
 
@@ -66,7 +62,6 @@ class FLChain:
             "maxPriorityFeePerGas": int(tip),
             "maxFeePerGas": int(base_fee + 2 * tip),
         }
-
         return fn(*args).build_transaction(tx_args)
 
     def _send(self, tx: dict) -> str:
@@ -83,63 +78,56 @@ class FLChain:
                 return True
         return False
 
-    # ---------------- baseline helpers ----------------
+    # ---------------- baseline ----------------
 
     def assign_baseline(self, hash_hex: str, round_id: int, writer_id: int, num_chunks: int) -> str:
-        """
-        assignBaseline(bytes32 hash, uint256 roundId, uint256 writerId, uint256 numChunks)
-        """
         if hash_hex.startswith(("0x", "0X")):
             hash_hex = hash_hex[2:]
         if len(hash_hex) != 64:
             raise ValueError("baseline hash must be 32 bytes (64 hex chars)")
         b32 = bytes.fromhex(hash_hex)
-
         fn = self.contract.functions.assignBaseline
         tx = self._build_tx(fn, b32, int(round_id), int(writer_id), int(num_chunks))
         return self._send(tx)
 
     def get_baseline(self) -> Tuple[bool, str, int, int, int]:
-        """
-        getBaseline() -> (bool set, bytes32 hash, uint256 roundId, uint256 writerId, uint256 numChunks)
-        Return hash as a lower hex string without 0x.
-        """
         set_, h, rid, wid, n = self.contract.functions.getBaseline().call()
         return bool(set_), h.hex(), int(rid), int(wid), int(n)
 
-    # ---------------- contract calls ----------------
+    # ---------------- initial reputations ----------------
+
+    def assign_initial_reputations(self, client_ids: list[int], scaled_reps: list[int]) -> str:
+        if len(client_ids) != len(scaled_reps):
+            raise ValueError("client_ids and scaled_reps must have same length")
+        fn = self.contract.functions.assignInitialReputations
+        tx = self._build_tx(fn, client_ids, scaled_reps)
+        return self._send(tx)
+
+    def get_initial_reputation(self, client_id: int) -> int:
+        return int(self.contract.functions.getInitialReputation(int(client_id)).call())
+
+    # ---------------- proposals/finalization ----------------
 
     def submit_proposal(self, round_id: int, agg_id: int, hash_hex: str) -> str:
-        """submitProposal(uint256 roundId, uint256 aggId, bytes32 hash)"""
         if hash_hex.startswith(("0x", "0X")):
             hash_hex = hash_hex[2:]
         if len(hash_hex) != 64:
             raise ValueError("hash_hex must be 32 bytes (64 hex chars)")
         b32 = bytes.fromhex(hash_hex)
-
         fn = self.contract.functions.submitProposal
         tx = self._build_tx(fn, int(round_id), int(agg_id), b32)
         return self._send(tx)
 
     def finalize(self, round_id: int, total_selected: int) -> str:
-        """finalize(uint256 roundId, uint256 totalSelected)"""
         fn = self.contract.functions.finalize
         tx = self._build_tx(fn, int(round_id), int(total_selected))
         return self._send(tx)
 
     def get_round(self, round_id: int) -> Tuple[bool, str]:
-        """
-        getRound(uint256) -> (bool finalized, bytes32 consensusHash)
-        Returns (finalized, hex_string_without_0x)
-        """
         finalized, h = self.contract.functions.getRound(int(round_id)).call()
         return bool(finalized), h.hex()
 
     def get_votes(self, round_id: int, hash_hex: str) -> int:
-        """
-        Optional: getVotes(uint256, bytes32) -> uint256
-        If ABI does not expose it (or reverts), return 0.
-        """
         try:
             if not self._has_function("getVotes"):
                 return 0

@@ -129,13 +129,6 @@ def run_rounds(
     ]
     ensure_csv("artifacts/metrics.csv", csv_fields)
 
-    # Initial reputation ∝ data size
-    sizes = [c.num_examples() for c in clients]
-    total_k = float(sum(sizes)) or 1.0
-    reputation: Dict[int, float] = {c.cid: (sizes[idx] / total_k) for idx, c in enumerate(clients)}
-    print("Client sizes:", {c.cid: sizes[idx] for idx, c in enumerate(clients)})
-    print("Init reputations:", {cid: round(reputation[cid], 4) for cid in sorted(reputation)})
-
     # On-chain setup
     load_dotenv()
     rpc_url = os.getenv("RPC_URL", "http://127.0.0.1:8545")
@@ -161,7 +154,7 @@ def run_rounds(
     baseline_chunks, _ = store.upload_blob(round_base, baseline_ns_id, baseline_blob, chunk_size=global_chunk_size)
     print(f"[Baseline] hash={baseline_hash[:12]}..  chunks={baseline_chunks}  ns_id={baseline_ns_id}")
 
-    # Assign baseline on-chain (one-shot, authoritative pointer)
+    # Assign baseline on-chain
     chain.assign_baseline(
         hash_hex=baseline_hash,
         round_id=round_base,
@@ -169,11 +162,32 @@ def run_rounds(
         num_chunks=baseline_chunks
     )
 
+    # -------- Initial reputations assignment on-chain --------
+    sizes = [c.num_examples() for c in clients]
+    total_k = float(sum(sizes)) or 1.0
+    rep_float = [s / total_k for s in sizes]
+    REP_SCALE = 1_000_000
+    scaled = [int(round(r * REP_SCALE)) for r in rep_float]
+    drift = REP_SCALE - sum(scaled)
+    if drift != 0:
+        j = max(range(len(scaled)), key=lambda i: scaled[i])
+        scaled[j] = max(0, scaled[j] + drift)
+    client_ids = [int(c.cid) for c in clients]
+    try:
+        chain.assign_initial_reputations(client_ids, scaled)
+        print(f"Assigned initial reputations on-chain for {len(client_ids)} clients.")
+    except Exception as e:
+        print(f"[INFO] assign_initial_reputations skipped/failed: {e}")
+    reputation: Dict[int, float] = {}
+    for cid in client_ids:
+        rep_scaled = chain.get_initial_reputation(cid)
+        reputation[cid] = float(rep_scaled) / REP_SCALE
+    print("Init reputations (on-chain):", {cid: round(reputation[cid], 6) for cid in sorted(reputation)})
+
     # -------- All parties pull the authoritative baseline from chain --------
     set_, b_hash_hex, rid, wid, n_chunks = chain.get_baseline()
     if not set_:
         raise RuntimeError("Baseline not assigned on-chain")
-    # Pull baseline via FLStorage pointer (rid,wid)
     for c in clients:
         c.sync_from_storage(store, round_id=rid, writer_id=wid, template=global_params, chunk_size=global_chunk_size)
     blob0 = store.download_blob(rid, wid, chunk_size=global_chunk_size)
@@ -184,7 +198,6 @@ def run_rounds(
     save_model_state_dict("artifacts/checkpoints/round_000.pt", global_model.state_dict())
     prev_val_acc = accuracy(global_model, valloader)
 
-    # Track authoritative source for next pulls
     current_global_round_id = rid
     current_global_writer_ns = wid
 
@@ -264,7 +277,7 @@ def run_rounds(
             proposals.append({"agg_id": agg.cid, "params": agg_params, "hash": h, "val_acc": prop_val_acc})
             print(f" • Agg {agg.cid}: hash={h[:12]} V-acc={prop_val_acc:.4f}")
 
-        # On-chain finalize (V1 stub)
+        # On-chain finalize
         for p in proposals:
             chain.submit_proposal(round_id=round_id, agg_id=int(p["agg_id"]), hash_hex="0x" + p["hash"])
         try:
@@ -331,7 +344,6 @@ def run_rounds(
         converged = (delta < epsilon)
         print(f"Δ={delta:.6f}, new V-acc={new_val_acc:.4f}, converged={converged}")
 
-        # Advance pointer for next round pulls
         current_global_round_id = round_id
         current_global_writer_ns = global_ns_id
         prev_val_acc = new_val_acc
@@ -373,7 +385,7 @@ def run_rounds(
 
 if __name__ == "__main__":
     run_rounds(
-        num_clients=6, num_aggregators=3, k_aggregators=2,
+        num_clients=6, num_aggregators=6, k_aggregators=2,
         max_rounds=10, local_epochs=1, lr=0.01,
         tau=1.0, gamma=0.20, non_iid=False,
         proportions=[0.35, 0.25, 0.18, 0.12, 0.06, 0.04],
