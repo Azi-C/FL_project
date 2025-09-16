@@ -36,7 +36,7 @@ def normalize_hex(hs) -> str:
             hs = hs[2:]
     return hs.lower()
 
-def select_aggregators_by_reputation(
+def select_aggregators_random(
     reputation: Dict[int, float],
     gamma: float,
     aggregators: List[Aggregator],
@@ -44,24 +44,22 @@ def select_aggregators_by_reputation(
     rng: np.random.Generator
 ) -> List[Aggregator]:
     """
-    Select aggregators with reputation >= gamma.
+    Uniform random selection among aggregators with reputation >= gamma.
     - If eligible <= k: return all eligible.
-    - If eligible > k: return top-k by reputation (ties broken randomly).
+    - If eligible > k: sample k without replacement uniformly at random.
     """
     if not aggregators or k <= 0:
         return []
 
-    # Build [(agg, rep)] for those meeting the gamma threshold
-    elig = [(a, float(reputation.get(a.cid, 0.0))) for a in aggregators if reputation.get(a.cid, 0.0) >= gamma]
+    eligible_aggs = [a for a in aggregators if reputation.get(a.cid, 0.0) >= gamma]
+    n = len(eligible_aggs)
+    if n == 0:
+        return []
+    if n <= k:
+        return eligible_aggs
 
-    if len(elig) <= k:
-        return [a for (a, _) in elig]
-
-    # Shuffle to break ties, then sort by rep desc
-    rng.shuffle(elig)
-    elig.sort(key=lambda t: t[1], reverse=True)
-    chosen = elig[:k]
-    return [a for (a, _) in chosen]
+    idxs = rng.choice(n, size=k, replace=False)
+    return [eligible_aggs[int(i)] for i in idxs]
 
 def first_free_round(chain: FLChain, start: int = 1, max_scan: int = 100000) -> int:
     """Find the first round id not yet finalized on chain."""
@@ -230,11 +228,11 @@ def run_rounds(
             failed_ids = [cid for cid in failed_ids if cid != best_id]
         print(f"[Validation τ={tau}] passed={sorted(valid_ids)} failed={sorted(failed_ids)}")
 
-        # Aggregator eligibility + selection
+        # Aggregator eligibility + random selection
         eligible = [a.cid for a in aggregs if reputation.get(a.cid,0.0) >= current_gamma]
         print(f"[Gamma] eligible={eligible}")
 
-        chosen = select_aggregators_by_reputation(
+        chosen = select_aggregators_random(
             reputation=reputation,
             gamma=current_gamma,
             aggregators=aggregs,
