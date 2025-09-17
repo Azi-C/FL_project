@@ -1,18 +1,18 @@
 # src/client_agent.py
 from __future__ import annotations
-import os, time, hashlib
+import os, time, hashlib, sys
 import numpy as np
 import torch
+from typing import List, Dict
 from dotenv import load_dotenv
-from web3 import Web3
 
 from .model import create_model
-from .utils import DEVICE, load_partition_for_client, train_one_epoch, params_to_numpy, numpy_to_params
-from .storage_chain import FLStorageChain, pack_params_float32, unpack_params_float32
+from .utils import DEVICE, train_one_epoch, params_to_numpy, numpy_to_params, load_partition_for_client
+from .storage_chain import FLStorageChain, pack_params_float32
 from .onchain_v2 import FLChainV2
 
 
-def hash_params_rounded(params, decimals=6) -> str:
+def hash_params_rounded(params: List[np.ndarray], decimals: int = 6) -> str:
     h = hashlib.sha256()
     for a in params:
         arr = np.asarray(a, dtype=np.float32)
@@ -25,9 +25,6 @@ class ClientAgent:
     def __init__(self, cid: int):
         load_dotenv(dotenv_path=".env")
         self.cid = int(cid)
-        self.num_clients  = int(os.getenv("NUM_CLIENTS", "6"))
-        self.lr           = float(os.getenv("LR", "0.01"))
-        self.local_epochs = int(os.getenv("LOCAL_EPOCHS", "1"))
 
         self.rpc_url      = os.getenv("RPC_URL", "http://127.0.0.1:8545")
         self.coord_addr   = os.getenv("CONTRACT_ADDRESS_V2")
@@ -36,131 +33,134 @@ class ClientAgent:
         if not (self.coord_addr and self.storage_addr and self.priv):
             raise RuntimeError("Missing CONTRACT_ADDRESS_V2 / FLSTORAGE_ADDRESS / PRIVKEY_*")
 
-        self.client_chunk_sz = int(os.getenv("CLIENT_CHUNK", "131072"))   # 128 KiB default
-        self.global_chunk_sz = int(os.getenv("GLOBAL_CHUNK", "131072"))   # 128 KiB default
-        self.max_rounds      = int(os.getenv("MAX_ROUNDS", "20"))
-        self.round_wait_s    = float(os.getenv("ROUND_WAIT_SEC", "0.2"))
-        self.finalize_wait_s = float(os.getenv("FINALIZE_WAIT_SEC", "60"))
+        self.local_epochs    = int(os.getenv("LOCAL_EPOCHS", "1"))
+        self.lr              = float(os.getenv("LR", "0.01"))
+        self.batch_size      = int(os.getenv("BATCH_SIZE", "32"))
+        self.client_chunk_sz = int(os.getenv("CLIENT_CHUNK", "4096"))
+        self.finalize_wait_s = int(os.getenv("FINALIZE_WAIT_SEC", "90"))
 
         self.chain = FLChainV2(self.rpc_url, self.coord_addr, self.priv)
         self.store = FLStorageChain(self.rpc_url, self.storage_addr, self.priv)
 
-        # Log which address and contracts this client uses (helps detect duplicate keys / wrong env)
-        print(
-            f"[Client {self.cid}] addr={Web3.to_checksum_address(self.store.sender)} "
-            f"contract={self.coord_addr} storage={self.storage_addr}",
-            flush=True
-        )
-
-        # Model + data partition
-        self.model = create_model().to(DEVICE)
+        # Local dataset
         self.trainloader = load_partition_for_client(
-            cid=self.cid, num_clients=self.num_clients, batch_size=32, non_iid=False
+            cid=self.cid,
+            num_clients=int(os.getenv("NUM_CLIENTS", "6")),
+            batch_size=self.batch_size,
+            non_iid=bool(int(os.getenv("NON_IID", "0"))),
+            labels_per_client=int(os.getenv("LABELS_PER_CLIENT", "2")),
         )
 
-        # ----- Bootstrap from on-chain baseline (with size guard) -----
-        set_, h_hex, rid, wid, _ = self.chain.get_baseline()
+        # Local model
+        self.model = create_model().to(DEVICE)
+
+        # Bootstrap baseline from chain
+        set_, h_hex, rid, wid, n_chunks = self.chain.get_baseline()
         if not set_:
             raise RuntimeError("Baseline not assigned on-chain.")
+        blob = self.store.download_blob(rid, wid, chunk_size=self.client_chunk_sz)
+        params = pack_params_float32(params_to_numpy(self.model))  # just for shape template
+        from .storage_chain import unpack_params_float32
+        base_params = unpack_params_float32(blob, params_to_numpy(self.model))
+        numpy_to_params(self.model, base_params)
+        print(f"[Client {self.cid}] bootstrapped baseline", flush=True)
 
-        tmpl = params_to_numpy(self.model)
-        expected_bytes = sum(int(np.prod(p.shape)) * 4 for p in tmpl)
-        blob = self.store.download_blob(rid, wid, chunk_size=self.global_chunk_sz)
+    # ---------- Helpers ----------
 
-        if len(blob) != expected_bytes:
-            raise RuntimeError(
-                f"[Client {self.cid}] Baseline blob size mismatch: expected {expected_bytes} bytes "
-                f"for current model, got {len(blob)}. Pointer round={rid}, writer={wid}. "
-                f"Redeploy coordinator and re-run assign_baseline to fix."
-            )
-
-        params = unpack_params_float32(blob, tmpl)
-        numpy_to_params(self.model, params)
-        print(f"[Client {self.cid}] bootstrapped baseline (bytes={len(blob)})", flush=True)
-
-    def _wait_until_round_begun(self, round_id: int, timeout_s: float = 30.0):
-        t0 = time.time()
-        while True:
+    def _is_finalized(self, round_id: int) -> bool:
+        try:
             begun, finalized, *_ = self.chain.get_round(round_id)
-            if begun:
-                return True
-            if time.time() - t0 > timeout_s:
-                print(f"[Client {self.cid}] round {round_id} not begun after {timeout_s}s — skipping.", flush=True)
-                return False
-            time.sleep(self.round_wait_s)
+            return bool(finalized)
+        except Exception as e:
+            print(f"[Client {self.cid}] get_round failed while checking finalized: {e}", flush=True)
+            return False
 
-    def _wait_for_finalized_and_pull(self, round_id: int, timeout_s: float):
-        t0 = time.time()
-        while True:
-            begun, finalized, winner_hash, win_agg, writer_id, n_chunks = self.chain.get_round(round_id)
-            if begun and finalized and writer_id != 0 and n_chunks != 0:
-                blob = self.store.download_blob(round_id, writer_id, chunk_size=self.global_chunk_sz)
-                if blob:
-                    tmpl = params_to_numpy(self.model)
-                    # Optional size check to guard corrupted uploads
-                    exp_bytes = sum(int(np.prod(p.shape)) * 4 for p in tmpl)
-                    if len(blob) != exp_bytes:
-                        print(f"[Client {self.cid}] warning: finalized blob size {len(blob)} != expected {exp_bytes}", flush=True)
-                    params = unpack_params_float32(blob, tmpl)
-                    numpy_to_params(self.model, params)
-                    print(f"[Client {self.cid}] pulled new global for r={round_id}", flush=True)
-                    return True
-            if time.time() - t0 > timeout_s:
-                print(f"[Client {self.cid}] round {round_id} not finalized after {timeout_s}s — moving on.", flush=True)
-                return False
-            time.sleep(self.round_wait_s)
-
-    def _local_train_once(self):
-        opt = torch.optim.SGD(self.model.parameters(), lr=self.lr, momentum=0.9)
-        crit = torch.nn.CrossEntropyLoss()
+    def _train_local(self):
+        optimizer = torch.optim.SGD(self.model.parameters(), lr=self.lr, momentum=0.9)
+        criterion = torch.nn.CrossEntropyLoss()
         for _ in range(self.local_epochs):
-            train_one_epoch(self.model, self.trainloader, crit, opt)
+            train_one_epoch(self.model, self.trainloader, criterion, optimizer)
 
     def _upload_and_commit(self, round_id: int):
+        # Skip if already finalized
+        if self._is_finalized(round_id):
+            print(f"[Client {self.cid}] r={round_id} already finalized — skipping commit.", flush=True)
+            return
+
         params = params_to_numpy(self.model)
         blob = pack_params_float32(params)
-        n_chunks, _ = self.store.upload_blob(round_id, self.cid, blob, chunk_size=self.client_chunk_sz)
+
+        try:
+            n_chunks, _ = self.store.upload_blob(round_id, self.cid, blob, chunk_size=self.client_chunk_sz)
+        except Exception as e:
+            print(f"[Client {self.cid}] upload_blob failed: {e}", flush=True)
+            return
 
         upd_hash = hash_params_rounded(params)
-        # Retry committing to tolerate transient fee/nonce issues
         tries = 6
         for t in range(tries):
+            if self._is_finalized(round_id):
+                print(f"[Client {self.cid}] r={round_id} finalized before commit attempt {t+1} — aborting.", flush=True)
+                return
             try:
                 self.chain.post_commit(round_id, self.cid, upd_hash)
                 print(f"[Client {self.cid}] r={round_id} uploaded {n_chunks} chunk(s), commit={upd_hash[:12]}..", flush=True)
                 return
             except Exception as e:
+                msg = str(e)
+                if "Finalized" in msg or "finalized" in msg:
+                    print(f"[Client {self.cid}] r={round_id} commit rejected (finalized) — aborting retries.", flush=True)
+                    return
                 print(f"[Client {self.cid}] post_commit attempt {t+1}/{tries} failed: {e}", flush=True)
                 time.sleep(0.5 + 0.2 * t)
-        raise RuntimeError(f"[Client {self.cid}] post_commit failed after {tries} attempts")
+
+        print(f"[Client {self.cid}] post_commit failed after {tries} attempts — giving up for r={round_id}.", flush=True)
+
+    def _wait_for_finalized_and_pull(self, round_id: int, timeout_s: int = None):
+        if timeout_s is None:
+            timeout_s = self.finalize_wait_s
+        deadline = time.time() + timeout_s
+        while time.time() < deadline:
+            begun, finalized, _, writer_id, n_chunks, _ = self.chain.get_round(round_id)
+            if finalized:
+                blob = self.store.download_blob(round_id, writer_id, chunk_size=self.client_chunk_sz)
+                from .storage_chain import unpack_params_float32
+                new_params = unpack_params_float32(blob, params_to_numpy(self.model))
+                numpy_to_params(self.model, new_params)
+                print(f"[Client {self.cid}] pulled global from r={round_id}", flush=True)
+                return
+            time.sleep(2.0)
+        raise RuntimeError(f"Round {round_id} not finalized after {timeout_s}s")
+
+    # ---------- Main loop ----------
 
     def run_loop(self, start_round_id: int):
-        rid = int(start_round_id)
-        rounds_done = 0
-        while rounds_done < self.max_rounds:
-            rounds_done += 1
-
-            # 1) Wait for round to be open; if not, skip to next
-            if not self._wait_until_round_begun(rid):
-                rid += 1
+        rid_hint = start_round_id
+        while True:
+            rid = rid_hint
+            # 1) Skip if round already finalized
+            if self._is_finalized(rid):
+                print(f"[Client {self.cid}] r={rid} already finalized — skipping train/commit.", flush=True)
+                rid_hint = rid + 1
                 continue
 
-            # 2) Train locally for this round
-            self._local_train_once()
+            # 2) Train locally
+            self._train_local()
 
-            # 3) Upload & commit (with retries)
+            # 3) Upload + commit
             self._upload_and_commit(rid)
 
-            # 4) Wait for finalize (don’t crash if it never happens)
-            self._wait_for_finalized_and_pull(rid, timeout_s=self.finalize_wait_s)
+            # 4) Wait for finalize & pull new global
+            self._wait_for_finalized_and_pull(rid)
 
-            # 5) Next round
-            rid += 1
+            # 5) Move to next round
+            rid_hint = rid + 1
 
 
 if __name__ == "__main__":
     load_dotenv(dotenv_path=".env")
-    rid = int(os.getenv("START_ROUND_ID", "1"))
     cid = int(os.getenv("CID", "0"))
+    rid = int(os.getenv("START_ROUND_ID", "1"))
+
     agent = ClientAgent(cid)
     agent.run_loop(start_round_id=rid)

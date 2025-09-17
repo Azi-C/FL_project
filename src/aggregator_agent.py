@@ -1,15 +1,20 @@
 # src/aggregator_agent.py
 from __future__ import annotations
-import os, json, time, hashlib
+import os, json, time, hashlib, sys
 import numpy as np
 import torch
-from typing import Dict, List, Optional
+from typing import Dict, List
 from dotenv import load_dotenv
 
 from .model import create_model
 from .utils import DEVICE, load_validation_loader, accuracy, params_to_numpy, numpy_to_params
 from .storage_chain import FLStorageChain, unpack_params_float32, pack_params_float32
 from .onchain_v2 import FLChainV2
+
+
+# ---- Global HALT marker (storage-based) ----
+HALT_NS_ID = 9_999_999
+HALT_BYTES = b"HALT"
 
 
 def hash_params_rounded(params, decimals: int = 6) -> str:
@@ -37,10 +42,12 @@ def fedavg_weighted(client_params: Dict[int, List[np.ndarray]],
 
 class AggregatorAgent:
     """
-    M1: multi-agrégateurs off-chain, un seul finalise.
-    - Tous observent commits et calculent la proposition.
-    - Seul le 'leader' publie le global (upload) + finalize.
-    - begin_round / finalize sont idempotents (guards).
+    Multi-aggregators off-chain, leader finalizes after commit+propose window.
+    - Syncs round from chain each loop.
+    - Grace wait/recheck when no commits.
+    - Non-leaders skip finalize.
+    - NO monotonic safeguard: always accept the new aggregated model.
+    - Global HALT: when any aggregator converges, write a HALT marker so all stop.
     """
     def __init__(self, agg_id: int):
         load_dotenv(dotenv_path=".env")
@@ -54,20 +61,20 @@ class AggregatorAgent:
             raise RuntimeError("Missing CONTRACT_ADDRESS_V2 / FLSTORAGE_ADDRESS / PRIVKEY_*")
 
         # Timing/config
-        self.commit_window_s  = int(float(os.getenv("ROUND_COMMIT_WINDOW_SEC", "30")))
-        self.propose_window_s = int(float(os.getenv("PROPOSE_WINDOW_SEC", "30")))
-        self.client_chunk_sz  = int(os.getenv("CLIENT_CHUNK", "4096"))
-        self.global_chunk_sz  = int(os.getenv("GLOBAL_CHUNK", "4096"))
-        self.epsilon          = float(os.getenv("EPSILON", "0.001"))
-        self.tau              = float(os.getenv("TAU", "1.0"))
-        self.max_rounds       = int(os.getenv("MAX_ROUNDS", "20"))
+        self.commit_window_s   = int(float(os.getenv("ROUND_COMMIT_WINDOW_SEC", "60")))
+        self.propose_window_s  = int(float(os.getenv("PROPOSE_WINDOW_SEC", "20")))
+        self.no_commit_grace_s = float(os.getenv("GRACE_NO_COMMIT_SEC", "5"))
+        self.finalize_buffer_s = float(os.getenv("FINALIZE_BUFFER_SEC", "3"))
+        self.client_chunk_sz   = int(os.getenv("CLIENT_CHUNK", "4096"))
+        self.global_chunk_sz   = int(os.getenv("GLOBAL_CHUNK", "4096"))
+        self.epsilon           = float(os.getenv("EPSILON", "0.001"))
+        self.tau               = float(os.getenv("TAU", "1.0"))
+        self.max_rounds        = int(os.getenv("MAX_ROUNDS", "20"))
 
-        # Multi-aggregator config
-        # 1) On essaie d'utiliser la liste on-chain (si beginRound l'a fournie)
-        # 2) Sinon, on tombe sur une liste statique via .env: AGG_SET_JSON ou AGG_COUNT
+        # Aggregator set config
         self.use_onchain_agglist = int(os.getenv("USE_ONCHAIN_AGG_LIST", "1")) == 1
         self.agg_count_fallback  = int(os.getenv("AGG_COUNT", "3"))
-        self.agg_set_json        = os.getenv("AGG_SET_JSON", "")  # ex: "[0,1,2]"
+        self.agg_set_json        = os.getenv("AGG_SET_JSON", "")
 
         # Chain + storage
         self.chain = FLChainV2(self.rpc_url, self.coord_addr, self.priv)
@@ -78,8 +85,15 @@ class AggregatorAgent:
         self.global_model = create_model().to(DEVICE)
         self.template = params_to_numpy(self.global_model)
 
+        # Track when rounds begin (local timestamps)
+        self._round_begin_ts: Dict[int, float] = {}
+
         # Bootstrap from baseline
-        set_, h_hex, rid, wid, _ = self.chain.get_baseline()
+        try:
+            set_, h_hex, rid, wid, _ = self.chain.get_baseline()
+        except Exception as e:
+            print(f"[Agg {self.agg_id}] RPC unavailable during get_baseline: {e}", flush=True)
+            sys.exit(1)
         if not set_:
             raise RuntimeError("Baseline not assigned on-chain.")
         blob = self.store.download_blob(rid, wid, chunk_size=self.global_chunk_sz)
@@ -89,12 +103,37 @@ class AggregatorAgent:
         self.prev_val_acc = accuracy(self.global_model, self.valloader)
         print(f"[Agg {self.agg_id}] bootstrapped baseline, prev_val_acc={self.prev_val_acc:.4f}", flush=True)
 
-    # ---------- helpers: aggregator set & leader election ----------
+    # ---------- sync helpers ----------
 
-    def _get_aggregator_set(self, round_id: int) -> List[int]:
+    def _first_open_round(self, start_hint: int = 1) -> int:
+        r = max(1, int(start_hint))
+        while True:
+            try:
+                begun, finalized, *_ = self.chain.get_round(r)
+            except Exception as e:
+                print(f"[Agg {self.agg_id}] RPC unavailable during get_round({r}): {e}", flush=True)
+                sys.exit(1)
+            if not begun and not finalized:
+                return r
+            if begun and not finalized:
+                return r
+            r += 1
+
+    def _note_round_begun(self, rid: int):
+        if rid not in self._round_begin_ts:
+            self._round_begin_ts[rid] = time.time()
+
+    def _sleep_until_propose_close(self, rid: int):
+        begin_ts = self._round_begin_ts.get(rid, time.time())
+        deadline = begin_ts + self.commit_window_s + self.propose_window_s
+        now = time.time()
+        if now < deadline:
+            time.sleep(deadline - now + self.finalize_buffer_s)
+
+    def _get_aggregator_set(self, rid: int) -> List[int]:
         if self.use_onchain_agglist:
             try:
-                lst = self.chain.get_aggregators(round_id)  # may be empty if non-paramétré
+                lst = self.chain.get_aggregators(rid)
                 if lst and all(isinstance(x, int) for x in lst):
                     return lst
             except Exception:
@@ -106,93 +145,125 @@ class AggregatorAgent:
                 pass
         return list(range(self.agg_count_fallback))
 
-    def _is_leader(self, round_id: int) -> bool:
-        A_t = self._get_aggregator_set(round_id)
+    def _is_leader(self, rid: int) -> bool:
+        A_t = self._get_aggregator_set(rid)
         if not A_t:
-            # fallback: tout le monde pense que le min est 0..agg_count-1; leader = min(range)
             A_t = list(range(self.agg_count_fallback))
         leader_id = min(A_t)
         is_leader = (self.agg_id == leader_id)
-        print(f"[Agg {self.agg_id}] round {round_id} aggregators={A_t} leader={leader_id} -> leader? {is_leader}", flush=True)
+        print(f"[Agg {self.agg_id}] round {rid} aggregators={A_t} leader={leader_id} -> leader? {is_leader}", flush=True)
         return is_leader
 
-    # ---------- round orchestration (idempotent) ----------
+    def _is_finalized(self, rid: int) -> bool:
+        try:
+            begun, finalized, *_ = self.chain.get_round(rid)
+            return bool(finalized)
+        except Exception:
+            return False
 
-    def _begin_round_if_needed(self, round_id: int):
-        begun, finalized, *_ = self.chain.get_round(round_id)
-        if begun:
+    def _is_halted(self) -> bool:
+        try:
+            blob = self.store.download_blob(0, HALT_NS_ID, chunk_size=64)
+            return bool(blob == HALT_BYTES)
+        except Exception:
+            return False
+
+    # ---------- orchestration ----------
+
+    def _begin_round_if_needed(self, rid: int, is_leader: bool):
+        if not is_leader:
+            try:
+                begun, finalized, *_ = self.chain.get_round(rid)
+                if begun:
+                    self._note_round_begun(rid)
+            except Exception:
+                pass
             return
+
+        try:
+            begun, finalized, *_ = self.chain.get_round(rid)
+        except Exception as e:
+            print(f"[Agg {self.agg_id}] RPC unavailable during get_round: {e}", flush=True)
+            sys.exit(1)
+
+        if begun:
+            self._note_round_begun(rid)
+            return
+
         now = int(time.time())
         try:
             self.chain.begin_round(
-                round_id,
+                rid,
                 now + self.commit_window_s,
                 now + self.commit_window_s + self.propose_window_s,
-                self._get_aggregator_set(round_id)
+                self._get_aggregator_set(rid),
             )
-            print(f"[Agg {self.agg_id}] began round {round_id}", flush=True)
-            # petit délai pour laisser les clients/agrégateurs observer l'état
+            print(f"[Agg {self.agg_id}] began round {rid}", flush=True)
+            self._note_round_begun(rid)
             time.sleep(0.5)
         except Exception as e:
-            print(f"[Agg {self.agg_id}] begin_round skipped: {e}", flush=True)
+            if "Round already begun" not in str(e):
+                print(f"[Agg {self.agg_id}] begin_round skipped: {e}", flush=True)
 
-    def _wait_for_commits_or_timeout(self, round_id: int, expected_clients: List[int]) -> List[int]:
+    def _wait_for_commits_or_timeout(self, rid: int, expected_clients: List[int]) -> List[int]:
         deadline = int(time.time()) + self.commit_window_s
-        committed: List[int] = []
-        seen = set()
+        committed, seen = [], set()
         while True:
-            for cid in expected_clients:
-                if cid in seen:
-                    continue
-                hh = self.chain.get_client_commit(round_id, cid)
-                if hh and int(hh, 16) != 0:
-                    seen.add(cid)
-                    committed.append(cid)
-            if len(seen) == len(expected_clients):
-                print(f"[Agg {self.agg_id}] all {len(expected_clients)} commits received.", flush=True)
-                return committed
-            if time.time() >= deadline:
-                print(f"[Agg {self.agg_id}] commit window elapsed. commits={sorted(list(seen))}", flush=True)
-                return committed
+            if self._is_halted():
+                return []
+            try:
+                for cid in expected_clients:
+                    if cid in seen: continue
+                    hh = self.chain.get_client_commit(rid, cid)
+                    if hh and int(hh, 16) != 0:
+                        seen.add(cid); committed.append(cid)
+            except Exception as e:
+                print(f"[Agg {self.agg_id}] RPC unavailable during get_client_commit: {e}", flush=True)
+                sys.exit(1)
+            if len(seen) == len(expected_clients): return committed
+            if time.time() >= deadline: return committed
             time.sleep(0.5)
 
-    def _download_client_params(self, round_id: int, cids: List[int]):
+    def _download_client_params(self, rid: int, cids: List[int]):
         out = {}
         for cid in cids:
             try:
-                blob = self.store.download_blob(round_id, cid, chunk_size=self.client_chunk_sz)
-                if not blob:
-                    continue
+                blob = self.store.download_blob(rid, cid, chunk_size=self.client_chunk_sz)
+                if not blob: continue
                 params = unpack_params_float32(blob, self.template)
                 out[cid] = params
             except Exception as e:
                 print(f"[Agg {self.agg_id}] download error for cid={cid}: {e}", flush=True)
         return out
 
-    def _upload_and_maybe_finalize(self, round_id: int, params, prop_hash: str, is_leader: bool):
-        """
-        M1 rule:
-        - Tous peuvent submit_proposal (utile pour M3).
-        - Seul le leader upload le global et tente finalize (les autres s'abstiennent).
-        - Si finalize échoue car déjà finalisé -> on log et on continue.
-        """
-        # Tous soumettent la proposition (hash)
-        try:
-            self.chain.submit_proposal(round_id, self.agg_id, prop_hash)
-        except Exception as e:
-            print(f"[Agg {self.agg_id}] submit_proposal skipped: {e}", flush=True)
+    def _upload_and_maybe_finalize(self, rid: int, params, prop_hash: str, is_leader: bool):
+        if not self._is_finalized(rid) and not self._is_halted():
+            try:
+                self.chain.submit_proposal(rid, self.agg_id, prop_hash)
+            except Exception as e:
+                if "Finalized" not in str(e):
+                    print(f"[Agg {self.agg_id}] submit_proposal skipped: {e}", flush=True)
 
         if not is_leader:
             print(f"[Agg {self.agg_id}] non-leader -> skip upload/finalize", flush=True)
             return
 
-        # Leader: upload + finalize
+        if self._is_halted():
+            print(f"[Agg {self.agg_id}] HALT detected before upload — skipping finalize.", flush=True)
+            return
+
         writer_id = 1_000_000 + self.agg_id
         blob = pack_params_float32(params)
-        n_chunks, _ = self.store.upload_blob(round_id, writer_id, blob, chunk_size=self.global_chunk_sz)
+        n_chunks, _ = self.store.upload_blob(rid, writer_id, blob, chunk_size=self.global_chunk_sz)
+
+        self._sleep_until_propose_close(rid)
+        if self._is_finalized(rid) or self._is_halted():
+            print(f"[Agg {self.agg_id}] already finalized or HALT — skipping finalize.", flush=True)
+            return
+
         try:
-            self.chain.finalize(round_id, self.agg_id, prop_hash, writer_id, n_chunks)
-            print(f"[Agg {self.agg_id}] finalized r={round_id} writer={writer_id} chunks={n_chunks}", flush=True)
+            self.chain.finalize(rid, self.agg_id, prop_hash, writer_id, n_chunks)
+            print(f"[Agg {self.agg_id}] finalized r={rid} writer={writer_id} chunks={n_chunks}", flush=True)
         except Exception as e:
             print(f"[Agg {self.agg_id}] finalize skipped: {e}", flush=True)
 
@@ -200,40 +271,63 @@ class AggregatorAgent:
 
     def run_until_convergence(self, start_round_id: int, client_sizes: Dict[int, int]):
         current_params = self.template
-        rid = int(start_round_id)
+        rid_hint = int(start_round_id)
         rounds_done = 0
 
         while rounds_done < self.max_rounds:
+            if self._is_halted():
+                print(f"[Agg {self.agg_id}] HALT detected — exiting.", flush=True)
+                return
+
+            rid = self._first_open_round(rid_hint)
             rounds_done += 1
             print(f"\n=== Round {rid} (Agg {self.agg_id}) ===", flush=True)
 
-            # 0) leader election view (log only)
+            try:
+                b, f, *_ = self.chain.get_round(rid)
+                if b:
+                    self._note_round_begun(rid)
+            except Exception:
+                pass
+
             is_leader = self._is_leader(rid)
+            self._begin_round_if_needed(rid, is_leader=is_leader)
 
-            # 1) open round (idempotent across aggregators)
-            self._begin_round_if_needed(rid)
-
-            # 2) collect commits
             expected_clients = list(client_sizes.keys())
             committed_cids = self._wait_for_commits_or_timeout(rid, expected_clients)
 
-            if not committed_cids:
-                print(f"[Agg {self.agg_id}] no commits; publishing current global to finalize round {rid}.", flush=True)
-                prop_hash = hash_params_rounded(current_params)
-                self._upload_and_maybe_finalize(rid, current_params, prop_hash, is_leader=is_leader)
-                rid += 1
-                continue
+            if not committed_cids and not self._is_halted():
+                if is_leader:
+                    print(f"[Agg {self.agg_id}] no commits; grace wait {self.no_commit_grace_s}s then recheck...", flush=True)
+                    time.sleep(self.no_commit_grace_s)
+                    old_window = self.commit_window_s
+                    self.commit_window_s = int(max(1, self.no_commit_grace_s))
+                    committed_cids = self._wait_for_commits_or_timeout(rid, expected_clients)
+                    self.commit_window_s = old_window
+                else:
+                    time.sleep(self.no_commit_grace_s)
 
-            # 3) download updates
+                if not committed_cids or self._is_halted():
+                    print(f"[Agg {self.agg_id}] still no commits; publishing current global.", flush=True)
+                    keep_hash = hash_params_rounded(current_params)
+                    self._upload_and_maybe_finalize(rid, current_params, keep_hash, is_leader)
+                    if self._is_halted():
+                        print(f"[Agg {self.agg_id}] HALT detected after no-commit path — exiting.", flush=True)
+                        return
+                    rid_hint = rid
+                    continue
+
             client_params = self._download_client_params(rid, committed_cids)
-            if not client_params:
-                print(f"[Agg {self.agg_id}] no params downloadable; publishing current global to finalize round {rid}.", flush=True)
-                prop_hash = hash_params_rounded(current_params)
-                self._upload_and_maybe_finalize(rid, current_params, prop_hash, is_leader=is_leader)
-                rid += 1
+            if not client_params or self._is_halted():
+                print(f"[Agg {self.agg_id}] no params downloadable or HALT — publishing current global.", flush=True)
+                keep_hash = hash_params_rounded(current_params)
+                self._upload_and_maybe_finalize(rid, current_params, keep_hash, is_leader)
+                if self._is_halted():
+                    print(f"[Agg {self.agg_id}] HALT detected after download path — exiting.", flush=True)
+                    return
+                rid_hint = rid
                 continue
 
-            # 4) validation gate
             base_acc = self.prev_val_acc
             valid_ids, failed_ids = [], []
             for cid, params in client_params.items():
@@ -254,13 +348,10 @@ class AggregatorAgent:
                         best_acc, best_c = ai, cid
                 if best_c is not None:
                     valid_ids = [best_c]
-
             print(f"[Agg {self.agg_id}] valid={sorted(valid_ids)} failed={sorted(failed_ids)}", flush=True)
 
-            # 5) aggregate
             aggregated = fedavg_weighted(client_params, client_sizes, valid_ids, current_params)
 
-            # 6) proposal + (leader) finalize
             tmp = create_model().to(DEVICE)
             numpy_to_params(tmp, aggregated)
             val_acc = accuracy(tmp, self.valloader)
@@ -269,7 +360,6 @@ class AggregatorAgent:
 
             self._upload_and_maybe_finalize(rid, aggregated, prop_hash, is_leader=is_leader)
 
-            # 7) local update & convergence check (même si non-leader, pour garder l'état aligné)
             numpy_to_params(self.global_model, aggregated)
             current_params = params_to_numpy(self.global_model)
             delta = abs(val_acc - self.prev_val_acc)
@@ -278,9 +368,14 @@ class AggregatorAgent:
 
             if delta < self.epsilon:
                 print(f"[Agg {self.agg_id}] Converged (Δ < ε={self.epsilon}). Stopping.", flush=True)
+                try:
+                    self.store.upload_blob(0, HALT_NS_ID, HALT_BYTES, chunk_size=64)
+                    print(f"[Agg {self.agg_id}] wrote HALT marker.", flush=True)
+                except Exception as e:
+                    print(f"[Agg {self.agg_id}] failed to write HALT marker: {e}", flush=True)
                 break
 
-            rid += 1
+            rid_hint = rid
 
 
 if __name__ == "__main__":
