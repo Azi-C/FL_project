@@ -1,7 +1,7 @@
 # src/node_agent.py
 from __future__ import annotations
 import os, time, json, hashlib
-from typing import Dict, List
+from typing import Dict, List, Optional
 
 import numpy as np
 import torch
@@ -78,7 +78,6 @@ class NodeAgent:
 
         # topology (for fallback aggregator selection)
         self.num_clients  = int(os.getenv("NUM_CLIENTS", "6"))
-        # use K_PROPOSERS if present; else K_AGGREGATORS; else default 2
         self.k_aggs = int(os.getenv("K_PROPOSERS", os.getenv("K_AGGREGATORS", "2")))
 
         # on-chain & storage
@@ -103,7 +102,7 @@ class NodeAgent:
         # round begin timestamps
         self._round_begin_ts: Dict[int, float] = {}
 
-        # baseline bootstrap
+        # baseline bootstrap (must exist on-chain)
         set_, _, rid, wid, _ = self.chain.get_baseline()
         if not set_:
             raise RuntimeError("Baseline not assigned on-chain.")
@@ -112,8 +111,11 @@ class NodeAgent:
         numpy_to_params(self.global_model, base_params)
         numpy_to_params(self.model, base_params)
         self.template = params_to_numpy(self.global_model)
-        self.prev_val_acc = accuracy(self.global_model, self.valloader)
-        print(f"[Node {self.cid}] bootstrapped baseline acc={self.prev_val_acc:.4f}", flush=True)
+
+        # Aggregators compute convergence; initialized per-round after sync
+        self.prev_val_acc: Optional[float] = None
+
+        print(f"[Node {self.cid}] bootstrapped baseline", flush=True)
 
         # expected client sizes
         sizes_env = os.getenv("CLIENT_SIZES_JSON", "")
@@ -163,6 +165,31 @@ class NodeAgent:
     def _is_leader(self, rid: int, agg_set: List[int]) -> bool:
         leader = min(agg_set) if agg_set else 0
         return self.cid == leader
+
+    def _pull_finalized_blocking(self, rid: int, timeout_s: int = 300) -> bool:
+        """
+        Block until round rid is finalized and pull its global. Returns True on success.
+        This guarantees every node starts next round from the same global.
+        """
+        if rid <= 0:
+            return True
+        deadline = time.time() + timeout_s
+        while time.time() < deadline and not self._is_halted():
+            begun, finalized, _h, writer_id, _n, _ = self._get_round(rid)
+            if finalized and writer_id:
+                try:
+                    blob = self.store.download_blob(rid, writer_id, chunk_size=self.global_chunk_sz)
+                    if blob:
+                        new_params = unpack_params_float32(blob, self.template)
+                        numpy_to_params(self.global_model, new_params)
+                        numpy_to_params(self.model, new_params)
+                        self.template = params_to_numpy(self.global_model)
+                        return True
+                except Exception as e:
+                    print(f"[Node {self.cid}] pull r={rid} failed: {e}", flush=True)
+            time.sleep(1.0)
+        print(f"[Node {self.cid}] pull r={rid} timed out.", flush=True)
+        return False
 
     # ----------------- training -----------------
     def _train_local(self, rid: int, start_hash: str):
@@ -229,7 +256,7 @@ class NodeAgent:
         if self._is_finalized(rid) or self._is_halted():
             return
         self.chain.finalize(rid, self.cid, h, writer_id, 0)
-        print(f"[Node {self.cid}] r={rid} FINALIZE leader=True used={'AGGREGATED' if used_agg else 'KEEP'}", flush=True)
+        print(f"[Node {self.cid}] r={rid} FINALIZE leader=True used={'AGGREGATED' if used_agg else 'KEEP'} writer={writer_id}", flush=True)
 
     # ----------------- main loop -----------------
     def run_loop(self, start_round_id: int):
@@ -238,7 +265,17 @@ class NodeAgent:
 
         while rounds_done < self.max_rounds:
             if self._is_halted():
+                print(f"[Node {self.cid}] HALT detected — exiting.", flush=True)
                 return
+
+            # --- STRONG SYNC: ensure we pulled the last finalized global (r-1) before starting r
+            r_prev = (rid_hint - 1) if rid_hint > 1 else 0
+            if r_prev > 0:
+                ok = self._pull_finalized_blocking(r_prev, timeout_s=self.finalize_wait_s)
+                if not ok:
+                    # If previous round never finalized within window, still proceed but warn
+                    print(f"[Node {self.cid}] WARN: proceeding without r={r_prev} pull.", flush=True)
+
             rid = self._first_open_round(rid_hint)
             rounds_done += 1
 
@@ -255,7 +292,7 @@ class NodeAgent:
             is_agg = self.cid in agg_set
             is_leader = self._is_leader(rid, agg_set)
 
-            # ensure round begun
+            # ensure round begun (leader only)
             begun, finalized, *_ = self._get_round(rid)
             if not begun and not finalized and is_leader:
                 now = int(time.time())
@@ -275,24 +312,20 @@ class NodeAgent:
                 if begun:
                     self._note_round_begun(rid)
 
-            print(f"\n=== Round {rid} (Node {self.cid}) role={'AGG' if is_agg else 'CLIENT'} leader={is_leader} ===", flush=True)
-            print(f"[Node {self.cid}] round-start acc={self.prev_val_acc:.4f}", flush=True)
+            role_str = f"{'AGG' if is_agg else 'CLIENT'} leader={is_leader}"
+            print(f"\n=== Round {rid} (Node {self.cid}) role={role_str} ===", flush=True)
 
-            # sync previous global if exists
-            if rid > 1:
-                _, finalized_prev, _, writer_id_prev, _, _ = self._get_round(rid - 1)
-                if finalized_prev and writer_id_prev:
-                    blob = self.store.download_blob(rid - 1, writer_id_prev, chunk_size=self.global_chunk_sz)
-                    if blob:
-                        new_params = unpack_params_float32(blob, self.template)
-                        numpy_to_params(self.model, new_params)
-                        numpy_to_params(self.global_model, new_params)
-                        self.template = params_to_numpy(self.global_model)
+            # ---- unify A_prev for aggregators at round start (after sync/pull of r-1) ----
+            if is_agg:
+                self.prev_val_acc = accuracy(self.global_model, self.valloader)
+                print(f"[Node {self.cid}] (agg) round-start acc={self.prev_val_acc:.4f}", flush=True)
 
+            # client training & commit (all nodes)
             start_hash = hash_params_rounded(params_to_numpy(self.model))[:12]
             self._train_local(rid, start_hash)
             self._upload_and_commit(rid)
 
+            # ---------- AGGREGATOR-ONLY path ----------
             if is_agg:
                 committed = self._wait_for_commits(rid, list(self.client_sizes.keys()))
                 print(f"[Node {self.cid}] r={rid} commits={committed}", flush=True)
@@ -300,21 +333,18 @@ class NodeAgent:
                 if committed:
                     cparams = self._download_client_params(rid, committed)
                     if cparams:
-                        # FedAvg (weighted by |D_i|)
+                        # Weighted FedAvg by |D_i|
                         aggregated = [np.zeros_like(p, dtype=np.float32) for p in self.template]
-                        total = float(sum(self.client_sizes.get(i, 1) for i in committed))
+                        total = float(sum(self.client_sizes.get(i, 1) for i in committed)) or 1.0
                         for cid in committed:
                             w = self.client_sizes.get(cid, 1) / total
                             for j in range(len(aggregated)):
                                 aggregated[j] += cparams[cid][j].astype(np.float32) * w
 
-                        agg_hash = hash_params_rounded(aggregated)[:12]
-                        print(f"[Node {self.cid}] r={rid} agg_hash={agg_hash}", flush=True)
-
+                        # Evaluate on shared V (AGGREGATORS ONLY)
                         tmp = create_model().to(DEVICE)
                         numpy_to_params(tmp, aggregated)
                         new_acc = accuracy(tmp, self.valloader)
-                        print(f"[Node {self.cid}] proposal acc={new_acc:.4f}", flush=True)
 
                         hh = hash_params_rounded(aggregated)
                         try:
@@ -322,36 +352,49 @@ class NodeAgent:
                         except Exception as e:
                             print(f"[Node {self.cid}] submit_proposal skipped: {e}", flush=True)
 
+                        # Convergence against same A_prev for all aggs
+                        base = self.prev_val_acc if self.prev_val_acc is not None else new_acc
+                        delta = abs(new_acc - base)
+                        status = "CONVERGED" if delta < self.epsilon else "NOT_CONVERGED"
+                        print(f"[Node {self.cid}] (agg) Δ={delta:.6f} ε={self.epsilon} → {status} | A_new={new_acc:.4f}", flush=True)
+
+                        # Leader uploads & finalizes (single writer)
                         if is_leader:
                             self._finalize_as_leader(rid, aggregated, hh, used_agg=True)
 
-                        numpy_to_params(self.global_model, aggregated)
-                        self.prev_val_acc = new_acc
+                        # If converged, leader writes HALT
+                        if delta < self.epsilon:
+                            if is_leader:
+                                try:
+                                    self.store.upload_blob(0, HALT_NS_ID, HALT_BYTES, chunk_size=64)
+                                    print(f"[Node {self.cid}] Converged — wrote HALT marker.", flush=True)
+                                except Exception as e:
+                                    print(f"[Node {self.cid}] HALT write failed: {e}", flush=True)
+                            return
                 elif is_leader:
+                    # No commits: keep current global, but still single-writer finalize
                     keep = params_to_numpy(self.global_model)
                     hh = hash_params_rounded(keep)
                     self._finalize_as_leader(rid, keep, hh, used_agg=False)
 
-            # pull finalized
-            deadline = time.time() + self.finalize_wait_s
-            while time.time() < deadline and not self._is_halted():
-                _, finalized, _, writer_id, _, _ = self._get_round(rid)
-                if finalized and writer_id:
-                    blob = self.store.download_blob(rid, writer_id, chunk_size=self.global_chunk_sz)
-                    if blob:
-                        new_params = unpack_params_float32(blob, self.template)
-                        old_hash = hash_params_rounded(params_to_numpy(self.global_model))[:12]
-                        new_hash = hash_params_rounded(new_params)[:12]
-                        numpy_to_params(self.global_model, new_params)
-                        numpy_to_params(self.model, new_params)
-                        self.template = params_to_numpy(self.global_model)
-                        new_acc = accuracy(self.global_model, self.valloader)
-                        print(f"[Node {self.cid}] pulled r={rid} hash {old_hash}->{new_hash} acc={new_acc:.4f}", flush=True)
-                        self.prev_val_acc = new_acc
-                    break
-                time.sleep(1.0)
+            # ---------- ALL NODES: strictly pull the finalized global for r ----------
+            ok = self._pull_finalized_blocking(rid, timeout_s=self.finalize_wait_s)
+            if not ok:
+                print(f"[Node {self.cid}] WARN: no finalized global pulled for r={rid}.", flush=True)
+            else:
+                if is_agg:
+                    # Aggregators refresh A_prev to finalized model for next round
+                    new_acc = accuracy(self.global_model, self.valloader)
+                    base = self.prev_val_acc if self.prev_val_acc is not None else new_acc
+                    delta = abs(new_acc - base)
+                    print(f"[Node {self.cid}] (agg) pulled r={rid} | Δ={delta:.6f} | acc={new_acc:.4f}", flush=True)
+                    self.prev_val_acc = new_acc
+                else:
+                    print(f"[Node {self.cid}] pulled r={rid} (updated local models).", flush=True)
 
             rid_hint = rid + 1
+
+        print(f"[Node {self.cid}] Max rounds reached — exiting.", flush=True)
 
 
 if __name__ == "__main__":
