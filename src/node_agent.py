@@ -21,13 +21,6 @@ from .onchain_v2 import FLChainV2
 HALT_NS_ID = 9_999_999
 HALT_BYTES = b"HALT"
 
-# ---- Round metadata (shared accuracy & hash) ----
-META_NS_ID = 8_888_888  # special writerId for per-round metadata
-def _meta_writer(round_id: int) -> int:
-    # single namespace is enough (one meta blob per round overwrites previous round)
-    # you can evolve to per-round (e.g., META_NS_ID + round_id) if preferred
-    return META_NS_ID
-
 
 def hash_params_rounded(params: List[np.ndarray], decimals: int = 6) -> str:
     h = hashlib.sha256()
@@ -230,38 +223,15 @@ class NodeAgent:
             time.sleep(0.5)
         return committed
 
-    def _finalize_as_leader(
-        self,
-        rid: int,
-        params: List[np.ndarray],
-        h: str,
-        used_agg: bool,
-        acc_shared: float | None = None,   # NEW: shared accuracy to publish
-    ) -> None:
-        # 1) upload global
+    def _finalize_as_leader(self, rid: int, params: List[np.ndarray], h: str, used_agg: bool):
         writer_id = 1_000_000 + self.cid
         blob = pack_params_float32(params)
         self.store.upload_blob(rid, writer_id, blob, chunk_size=self.global_chunk_sz)
-
-        # 2) upload round meta (hash + optional accuracy from aggregator)
-        try:
-            meta = {"hash": h, "acc": acc_shared}
-            meta_bytes = json.dumps(meta).encode("utf-8")
-            self.store.upload_blob(rid, _meta_writer(rid), meta_bytes, chunk_size=4096)
-        except Exception as e:
-            print(f"[Node {self.cid}] WARN: meta upload failed: {e}", flush=True)
-
-        # 3) wait propose-close window
         self._sleep_until_propose_close(rid)
         if self._is_finalized(rid) or self._is_halted():
             return
-
-        # 4) finalize on-chain
         self.chain.finalize(rid, self.cid, h, writer_id, 0)
-        print(
-            f"[Node {self.cid}] r={rid} FINALIZE leader=True used={'AGGREGATED' if used_agg else 'KEEP'}",
-            flush=True,
-        )
+        print(f"[Node {self.cid}] r={rid} FINALIZE leader=True used={'AGGREGATED' if used_agg else 'KEEP'}", flush=True)
 
     # ----------------- main loop -----------------
     def run_loop(self, start_round_id: int):
@@ -365,9 +335,9 @@ class NodeAgent:
                         status = "CONVERGED" if delta < self.epsilon else "NOT_CONVERGED"
                         print(f"[Node {self.cid}] (agg) Δ={delta:.6f} ε={self.epsilon} → {status} | A_new={new_acc:.4f}", flush=True)
 
-                        # Leader finalizes (publish shared accuracy meta)
+                        # Leader finalizes (but DO NOT mutate local global/prev here)
                         if is_leader:
-                            self._finalize_as_leader(rid, aggregated, hh, used_agg=True, acc_shared=float(new_acc))
+                            self._finalize_as_leader(rid, aggregated, hh, used_agg=True)
 
                         # If converged, leader writes HALT marker and stop; others just stop.
                         if delta < self.epsilon:
@@ -382,10 +352,9 @@ class NodeAgent:
                     # no commits -> keep current global (still finalize)
                     keep = params_to_numpy(self.global_model)
                     hh = hash_params_rounded(keep)
-                    # you may compute acc_shared here if you want a number instead of None
-                    self._finalize_as_leader(rid, keep, hh, used_agg=False, acc_shared=None)
+                    self._finalize_as_leader(rid, keep, hh, used_agg=False)
 
-            # ---------- ALL NODES: pull finalized (clients: no accuracy) ----------
+            # ---------- ALL NODES: pull finalized ----------
             deadline = time.time() + self.finalize_wait_s
             pulled = False
             while time.time() < deadline and not self._is_halted():
@@ -394,39 +363,31 @@ class NodeAgent:
                     blob = self.store.download_blob(rid, writer_id, chunk_size=self.global_chunk_sz)
                     if blob:
                         new_params = unpack_params_float32(blob, self.template)
+                        # (all nodes) update local models
                         numpy_to_params(self.global_model, new_params)
                         numpy_to_params(self.model, new_params)
                         self.template = params_to_numpy(self.global_model)
                         pulled = True
 
-                        # (NEW) Try read shared round meta: { "hash": "...", "acc": <float or null> }
-                        shared_acc = None
-                        try:
-                            m = self.store.download_blob(rid, _meta_writer(rid), chunk_size=4096)
-                            if m:
-                                meta = json.loads(m.decode("utf-8"))
-                                if isinstance(meta, dict) and ("acc" in meta):
-                                    shared_acc = meta["acc"]
-                        except Exception:
-                            pass
-
                         if is_agg:
                             # Aggregators refresh A_prev to finalized model for next round
-                            new_acc_eval = accuracy(self.global_model, self.valloader)
-                            delta = abs(new_acc_eval - (self.prev_val_acc if self.prev_val_acc is not None else new_acc_eval))
-                            shown = shared_acc if (shared_acc is not None) else new_acc_eval
-                            print(
-                                f"[Node {self.cid}] (agg) pulled r={rid} | Δ={delta:.6f} | acc={shown:.4f}"
-                                + (" (shared)" if shared_acc is not None else ""),
-                                flush=True,
-                            )
-                            self.prev_val_acc = new_acc_eval
+                            new_acc = accuracy(self.global_model, self.valloader)
+                            delta = abs(new_acc - (self.prev_val_acc if self.prev_val_acc is not None else new_acc))
+                            print(f"[Node {self.cid}] (agg) pulled r={rid} | Δ={delta:.6f} | acc={new_acc:.4f} (shared)", flush=True)
+
+                            # NEW: if an aggregator sees convergence after pulling, write HALT and stop
+                            if delta < self.epsilon:
+                                try:
+                                    self.store.upload_blob(0, HALT_NS_ID, HALT_BYTES, chunk_size=64)
+                                    print(f"[Node {self.cid}] Converged — HALT written (post-pull).", flush=True)
+                                except Exception as e:
+                                    print(f"[Node {self.cid}] HALT write failed (post-pull): {e}", flush=True)
+                                return
+
+                            # not converged → carry this forward
+                            self.prev_val_acc = new_acc
                         else:
-                            # Clients do NOT recompute accuracy; display shared value if available
-                            if shared_acc is not None:
-                                print(f"[Node {self.cid}] ACCEPTED r={rid} | acc={float(shared_acc):.4f} (shared)", flush=True)
-                            else:
-                                print(f"[Node {self.cid}] ACCEPTED r={rid} (updated models; acc unknown)", flush=True)
+                            print(f"[Node {self.cid}] ACCEPTED r={rid} (model updated).", flush=True)
                     break
                 time.sleep(1.0)
 
